@@ -1,4 +1,4 @@
-# Virtual-Analogue-Compressor-Modelling
+# Virtual Analogue Modelling of a Compressor
 
 ## Deliverables
 
