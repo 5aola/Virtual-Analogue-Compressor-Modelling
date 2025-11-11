@@ -8,6 +8,7 @@
 4. [Diff-SSL-G-COMP: Towards a large-scale and diverse dataset for virtual analog modeling](https://ar5iv.org/html/2504.04589v1)
 ### Technicalities
 1. [ANTIALIASED BLACK-BOX MODELING OF AUDIO DISTORTION CIRCUITS USING REAL LINEAR RECURRENT UNITS](https://dafx.de/paper-archive/2025/DAFx25_paper_61.pdf)
+2. [A metric on the similarity between two frequency response functions (FRAC)](https://www.sciencedirect.com/science/article/pii/S0022460X18305650?via%3Dihub)
 
 ## Deliverables
 
