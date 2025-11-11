@@ -5,14 +5,17 @@
 1. Gather a subset of the dataset of Diff-SSL for experimenting
 2. Extract gain reduction
 3. Test models/do small trainings
-    - TCN
-    - GCN
-    - LSTM
-    - ED
-    - S6 ??
+    - build new
+        - predict gain reduction and condition another network with that
+    - Used models:
+        - TCN
+        - GCN
+        - LSTM
+        - ED
+        - S6 ??
     - conditioning: FILM
-4. Optimize models
-5. Improve Loss function
+5. Optimize models
+6. Improve Loss function
     - RDC
     - FRAC
     - Spectral Flatness
