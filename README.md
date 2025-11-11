@@ -13,4 +13,7 @@
     - conditioning: FILM
 4. Optimize models
 5. Improve Loss function
-6. Evaluate on bigger datasets and compare with other models
+    - RDC
+    - FRAC
+    - Spectral Flatness
+7. Evaluate on bigger datasets and compare with other models
