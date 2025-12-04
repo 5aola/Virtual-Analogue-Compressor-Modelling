@@ -32,14 +32,13 @@ def get_audio_stats(audio, sr = SR):
     return ebu_integrated, loudness_range
     
 
-def window_rms(signal, window_size, sr = SR, in_dB = False):
+def window_rms(t, signal, window_size, sr = SR, in_dB = False):
     window_size = int(window_size)
 
     signal2 = np.square(signal)
     window = np.ones(window_size)/float(window_size)
     rms = np.sqrt(np.convolve(signal2, window, 'valid'))
-    t = np.arange(len(signal)) / sr
-    t = t[window_size//2:-window_size//2+1]
+    t = t[window_size//2+1:-window_size//2+2]
     if in_dB:
         rms = to_dB(rms)
 
