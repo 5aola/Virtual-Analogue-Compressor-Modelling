@@ -18,3 +18,4 @@
 5. Optimize models
 6. Improve Loss function
 7. Evaluate on bigger datasets and compare with other models
+8. Unsupervised methods?
