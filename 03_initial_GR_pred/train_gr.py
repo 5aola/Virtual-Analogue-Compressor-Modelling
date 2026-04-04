@@ -8,17 +8,35 @@ Target: normalised GR (dB) [B, 1, T]   (from 1024-sample windowed RMS)
 Loss:   Smooth L1 + temporal-difference (attack/release dynamics)
 
 Usage:
-    python 03_initial_GR_pred/train_gr.py                          # defaults
-    python 03_initial_GR_pred/train_gr.py --max_epochs 200         # override
-    python 03_initial_GR_pred/train_gr.py --data_root /path/to/data --batch_size 8
+    uv run python 03_initial_GR_pred/train_gr.py
+    uv run python 03_initial_GR_pred/train_gr.py --max_epochs 200 --batch_size 8
+
+Quick smoke-test (a few minutes, validates the full pipeline):
+    uv run python 03_initial_GR_pred/train_gr.py --fast_dev_run
 """
 
 import argparse
 import os
+import sys
+
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+import types
+
 import torch
 import torch.nn.functional as F
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+
+# nablafx's DDSP processors pull in rational-activations which is incompatible
+# with torch>=2 / Python 3.10+.  TCN doesn't use it, so provide a no-op stub.
+if "rational" not in sys.modules:
+    _r = types.ModuleType("rational")
+    _rt = types.ModuleType("rational.torch")
+    _rt.Rational = type("Rational", (torch.nn.Module,), {"forward": lambda self, x: x})
+    _r.torch = _rt
+    sys.modules["rational"] = _r
+    sys.modules["rational.torch"] = _rt
 
 from nablafx.processors import TCN
 
@@ -133,12 +151,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_epochs", type=int, default=100)
     p.add_argument("--accelerator", type=str, default="mps")
     p.add_argument("--precision", type=str, default="32-true")
+    p.add_argument(
+        "--fast_dev_run", action="store_true",
+        help="Quick smoke-test: tiny model, 2 epochs, 4 batches, 1 worker",
+    )
 
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.fast_dev_run:
+        args.num_blocks = 4
+        args.channel_width = 16
+        args.max_epochs = 2
+        args.batch_size = 4
+        args.num_workers = 0
+        print("=== FAST DEV RUN — tiny model, 2 epochs, limit_train/val_batches=4 ===")
 
     # ---- data ----
     dm = GainReductionDataModule(
@@ -187,7 +217,7 @@ def main() -> None:
     lr_cb = LearningRateMonitor(logging_interval="epoch")
 
     # ---- trainer ----
-    trainer = pl.Trainer(
+    trainer_kwargs = dict(
         max_epochs=args.max_epochs,
         accelerator=args.accelerator,
         precision=args.precision,
@@ -195,7 +225,11 @@ def main() -> None:
         log_every_n_steps=10,
         default_root_dir="03_initial_GR_pred/lightning_logs",
     )
+    if args.fast_dev_run:
+        trainer_kwargs["limit_train_batches"] = 4
+        trainer_kwargs["limit_val_batches"] = 4
 
+    trainer = pl.Trainer(**trainer_kwargs)
     trainer.fit(system, dm)
 
 

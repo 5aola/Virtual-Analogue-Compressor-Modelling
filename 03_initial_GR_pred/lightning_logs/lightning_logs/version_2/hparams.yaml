@@ -1,0 +1,8 @@
+batch_size: 16
+data_root: /Volumes/Saola's Drive/AllCode/thesis/data/Diff-SSL-G-Comp
+num_workers: 4
+rms_window: 1024
+sample_length: 132300
+sample_rate: 44100
+settings_folder: threshold_-4_attack_1_release_0.4_ratio_10
+train_split: 0.8

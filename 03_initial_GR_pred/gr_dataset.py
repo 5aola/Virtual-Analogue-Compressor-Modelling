@@ -13,6 +13,7 @@ import os
 import glob
 import torch
 import torchaudio
+import soundfile as sf
 import lightning as pl
 from torch.utils.data import Dataset, DataLoader
 from typing import Optional
@@ -93,8 +94,8 @@ class GainReductionDataset(Dataset):
         # chunk each file into fixed-length segments
         self.samples: list[dict] = []
         for dry_path, wet_path in pairs:
-            md = torchaudio.info(dry_path)
-            n_frames = md.num_frames
+            md = sf.info(dry_path)
+            n_frames = md.frames
             if sample_length == -1:
                 self.samples.append(
                     {"dry": dry_path, "wet": wet_path, "offset": 0, "frames": n_frames}
@@ -125,12 +126,19 @@ class GainReductionDataset(Dataset):
         s = self.samples[idx]
         nf = s["frames"] if self.sample_length != -1 else -1
 
-        dry, sr = torchaudio.load(
-            s["dry"], frame_offset=s["offset"], num_frames=nf, normalize=True
+        dry, sr = sf.read(
+            s["dry"], start=s["offset"],
+            stop=None if nf == -1 else s["offset"] + nf,
+            dtype="float32", always_2d=True,
         )
-        wet, sr_w = torchaudio.load(
-            s["wet"], frame_offset=s["offset"], num_frames=nf, normalize=True
+        dry = torch.from_numpy(dry.T)  # (channels, samples)
+
+        wet, sr_w = sf.read(
+            s["wet"], start=s["offset"],
+            stop=None if nf == -1 else s["offset"] + nf,
+            dtype="float32", always_2d=True,
         )
+        wet = torch.from_numpy(wet.T)
 
         # resample if needed
         if sr != self.sample_rate:
