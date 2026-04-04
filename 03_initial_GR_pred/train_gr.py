@@ -151,6 +151,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_epochs", type=int, default=100)
     p.add_argument("--accelerator", type=str, default="mps")
     p.add_argument("--precision", type=str, default="32-true")
+    p.add_argument("--max_time", type=str, default=None,
+                   help="Wall-clock time limit, e.g. '00:00:10:00' (10 min)")
     p.add_argument(
         "--fast_dev_run", action="store_true",
         help="Quick smoke-test: tiny model, 2 epochs, 4 batches, 1 worker",
@@ -225,6 +227,8 @@ def main() -> None:
         log_every_n_steps=10,
         default_root_dir="03_initial_GR_pred/lightning_logs",
     )
+    if args.max_time is not None:
+        trainer_kwargs["max_time"] = args.max_time
     if args.fast_dev_run:
         trainer_kwargs["limit_train_batches"] = 4
         trainer_kwargs["limit_val_batches"] = 4
