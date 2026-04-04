@@ -56,11 +56,12 @@ dset_filtering/dset_env/
 .cursor
 .venv
 
-# downloaded models: 
+# raw nablafx library (kept at repo root for sys.path compatibility)
 nablafx
-nablafx-for-diffssl-compressor
-Optical-DRC-with-Selective-SSMs
-signaltrain
 
+# external projects (cloned repos for SOTA comparison)
+external/
+
+# generated outputs
+B_sota_analysis/eval_output/
 test_samples
-checkpoints_fad
