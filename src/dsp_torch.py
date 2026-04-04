@@ -1,11 +1,14 @@
 """
-PyTorch-based DSP utilities: RMS envelopes, gain reduction, GR normalisation.
+PyTorch-based DSP utilities: RMS envelopes, gain reduction, GR normalisation,
+and compressor-parameter normalisation.
 
 Intended for training pipelines where the computation graph must stay on GPU.
 """
 
 import torch
 import torch.nn.functional as F
+
+from src.dsp import PARAM_ORDER, PARAM_RANGES_LOCAL
 
 # ---------------------------------------------------------------------------
 # Gain-reduction normalisation constants
@@ -77,3 +80,28 @@ def normalize_gr(gr_db: torch.Tensor) -> torch.Tensor:
 def denormalize_gr(gr_norm: torch.Tensor) -> torch.Tensor:
     """Map ``[-1, 1]`` → ``[GR_DB_MIN, GR_DB_MAX]``."""
     return (gr_norm + 1) / 2 * (GR_DB_MAX - GR_DB_MIN) + GR_DB_MIN
+
+
+# ---------------------------------------------------------------------------
+# Compressor-parameter normalisation
+# ---------------------------------------------------------------------------
+
+
+def normalize_params(
+    threshold: float,
+    attack: float,
+    release: float,
+    ratio: float,
+    ranges: dict | None = None,
+) -> torch.Tensor:
+    """Map raw compressor parameters to ``[0, 1]`` using *ranges*.
+
+    Default ranges are :data:`PARAM_RANGES_LOCAL`.
+    """
+    if ranges is None:
+        ranges = PARAM_RANGES_LOCAL
+    raw = torch.tensor([threshold, attack, release, ratio], dtype=torch.float32)
+    for i, key in enumerate(PARAM_ORDER):
+        lo, hi = ranges[key]
+        raw[i] = (raw[i] - lo) / (hi - lo)
+    return raw.clamp(0, 1)

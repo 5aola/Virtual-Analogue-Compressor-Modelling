@@ -8,7 +8,7 @@ target WAV per setting folder). No model inference — only GT targets.
 Usage
 -----
     uv run python plot_steepness_vs_params.py
-    uv run python B_sota_analysis/plot_steepness_vs_params.py --output_dir B_sota_analysis/eval_output/steepness_plots
+    uv run python 02_sota_analysis/plot_steepness_vs_params.py --output_dir 02_sota_analysis/eval_output/steepness_plots
 """
 
 import argparse
@@ -21,20 +21,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from src.dsp import estimate_attack_release_time
-from B_sota_analysis.eval_all_settings import (
-    GT_ROOT,
-    INPUT_ROOT,
-    INPUT_NAME,
-    discover_settings,
-)
-from B_sota_analysis.eval_nabla_models import SAMPLE_RATE, load_wav
+from dataset import GT_ROOT, INPUT_ROOT, INPUT_NAME, TARGET_NAME, discover_settings
+from eval_nabla_models import SAMPLE_RATE, load_wav
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gt_root", default=GT_ROOT)
     parser.add_argument("--input_wav", default=os.path.join(INPUT_ROOT, INPUT_NAME))
-    parser.add_argument("--output_dir", default="B_sota_analysis/eval_output/steepness_vs_params")
+    parser.add_argument("--output_dir", default="02_sota_analysis/eval_output/steepness_vs_params")
     parser.add_argument("--window_size", type=int, default=64)
     parser.add_argument("--sr", type=int, default=None)
     args = parser.parse_args()
@@ -60,7 +55,10 @@ def main():
     release_steepness = []
 
     for i, s in enumerate(settings):
-        y = load_wav(s["target_path"], sr)
+        target_path = os.path.join(s["path"], TARGET_NAME)
+        if not os.path.isfile(target_path):
+            continue
+        y = load_wav(target_path, sr)
         min_len = min(len(x), len(y))
         x_trim = x[:min_len].astype(np.float32)
         y_trim = y[:min_len].astype(np.float32)

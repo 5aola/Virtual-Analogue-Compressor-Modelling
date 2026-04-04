@@ -8,7 +8,7 @@ for each setting.
 
 Usage
 -----
-    uv run python B_sota_analysis/eval_all_settings.py \
+    uv run python 02_sota_analysis/eval_all_settings.py \
         --ckpt "external/nablafx-for-diffssl-compressor/experiments/TCN_L_TF/dafx/brqmbvok/checkpoints/last.ckpt" \
         --device mps
 
@@ -20,7 +20,6 @@ import argparse
 import csv
 import math
 import os
-import re
 
 import matplotlib
 
@@ -32,8 +31,9 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from src.dsp import estimate_attack_release_time, moving_rms
-from B_sota_analysis.eval_nabla_models import (
+from src.dsp import calculate_rms, estimate_attack_release_time, moving_rms, rms_to_db
+from dataset import GT_ROOT, INPUT_ROOT, INPUT_NAME, TARGET_NAME, discover_settings
+from eval_nabla_models import (
     SAMPLE_RATE,
     load_model,
     load_wav,
@@ -41,53 +41,13 @@ from B_sota_analysis.eval_nabla_models import (
     run_model,
 )
 
-GT_ROOT = "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_ground_truth"
-INPUT_ROOT = "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_normalized"
-INPUT_NAME = "Electrvm_UnmasteredWAV.wav"
-TARGET_NAME = "Electrvm-exported.wav"
-
-SETTING_RE = re.compile(
-    r"^threshold_(?P<threshold>-?\d+(?:\.\d+)?)"
-    r"_attack_(?P<attack>\d+(?:\.\d+)?)"
-    r"_release_(?P<release>\d+(?:\.\d+)?)"
-    r"_ratio_(?P<ratio>\d+(?:\.\d+)?)$"
-)
-
-
-def discover_settings(gt_root: str) -> list[dict]:
-    """Scan *gt_root* for setting folders and return parsed parameter dicts."""
-    settings = []
-    for name in sorted(os.listdir(gt_root)):
-        full = os.path.join(gt_root, name)
-        if not os.path.isdir(full):
-            continue
-        m = SETTING_RE.match(name)
-        if m is None:
-            print(f"  [skip] {name!r} — does not match pattern")
-            continue
-        target = os.path.join(full, TARGET_NAME)
-        if not os.path.isfile(target):
-            print(f"  [skip] {name!r} — no {TARGET_NAME}")
-            continue
-        settings.append(
-            {
-                "folder": name,
-                "target_path": target,
-                "threshold": float(m.group("threshold")),
-                "attack": float(m.group("attack")),
-                "release": float(m.group("release")),
-                "ratio": float(m.group("ratio")),
-            }
-        )
-    return settings
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--sample_rate", type=int, default=None)
-    parser.add_argument("--output_dir", default="B_sota_analysis/eval_output/all_settings")
+    parser.add_argument("--output_dir", default="02_sota_analysis/eval_output/all_settings")
     parser.add_argument("--gt_root", default=GT_ROOT)
     parser.add_argument("--input_wav", default=os.path.join(INPUT_ROOT, INPUT_NAME))
     args = parser.parse_args()
@@ -121,9 +81,17 @@ def main():
     mrstft_loss_fn = auraloss.freq.MultiResolutionSTFTLoss()
     print("Initialized L1 and Multi-Resolution STFT loss functions")
 
-    # --- discover settings ---
+    # --- discover settings (filter to those with the target song) ---
     print("\n--- Discovering settings ---")
-    settings = discover_settings(args.gt_root)
+    all_settings = discover_settings(args.gt_root)
+    settings = []
+    for s in all_settings:
+        target = os.path.join(s["path"], TARGET_NAME)
+        if os.path.isfile(target):
+            s["target_path"] = target
+            settings.append(s)
+        else:
+            print(f"  [skip] {s['folder_name']!r} — no {TARGET_NAME}")
     print(f"  Found {len(settings)} setting(s)\n")
 
     # --- initialize results storage ---
@@ -142,7 +110,7 @@ def main():
     lims = (-80, 0)
 
     for i, s in enumerate(settings):
-        label = s["folder"]
+        label = s["folder_name"]
         print(f"\n{'=' * 70}")
         print(f"[{i + 1}/{n}] {label}")
         print(
@@ -163,7 +131,7 @@ def main():
         y_t = run_model(model, x_t, controls)
         y_np = y_t.squeeze().numpy()
 
-        pred_rms_db = 20 * np.log10(max(np.sqrt(np.mean(y_np**2)), 1e-10))
+        pred_rms_db = float(rms_to_db(calculate_rms(y_np)))
         print(f"  pred rms={pred_rms_db:.1f} dB, peak={float(np.abs(y_np).max()):.4f}")
 
         # --- save output wav ---

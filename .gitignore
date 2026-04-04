@@ -63,5 +63,5 @@ nablafx
 external/
 
 # generated outputs
-B_sota_analysis/eval_output/
+02_sota_analysis/eval_output/
 test_samples

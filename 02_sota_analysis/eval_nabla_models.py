@@ -21,9 +21,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
 import torch
-import torchaudio
 import yaml
 
+from src.audio_io import load_wav
+from src.dsp import (
+    PARAM_RANGES_LOCAL,
+    PARAM_RANGES_NABLAFX,
+    calculate_rms,
+    rms_to_db,
+)
+from src.dsp_torch import normalize_params
 from src.plotting import compare_gain_curves, estimate_gain_curve
 
 sys.path.insert(
@@ -31,7 +38,7 @@ sys.path.insert(
     os.path.join(
         os.path.dirname(__file__), "..", "external", "nablafx-for-diffssl-compressor"
     ),
-)
+)  # local fork overrides pip-installed nablafx
 
 from nablafx.models import BlackBoxModel
 from nablafx.tcn import TCN
@@ -43,45 +50,6 @@ PROCESSOR_MAP = {
 }
 
 SAMPLE_RATE = 48000
-
-PARAM_ORDER = ["threshold", "attack", "release", "ratio"]
-
-# workspace-root dataset.py ranges
-PARAM_RANGES_LOCAL = {
-    "threshold": (-20.0, 0.0),
-    "attack": (0.1, 30.0),
-    "release": (0.1, 1.6),
-    "ratio": (2.0, 10.0),
-}
-
-# nablafx ParametricPluginDataset normalization (data.py lines 409-412):
-#   threshold: (val + 20) / 40  →  range [-20, 20]
-#   attack:     val / 30        →  range [0, 30]
-#   release:    val / 1.6       →  range [0, 1.6]
-#   ratio:      val / 10        →  range [0, 10]
-PARAM_RANGES_NABLAFX = {
-    "threshold": (-20.0, 20.0),
-    "attack": (0.0, 30.0),
-    "release": (0.0, 1.6),
-    "ratio": (0.0, 10.0),
-}
-
-
-def normalize_params(
-    threshold: float,
-    attack: float,
-    release: float,
-    ratio: float,
-    ranges: dict | None = None,
-) -> torch.Tensor:
-    """Map raw compressor parameters to [0, 1] using *ranges*."""
-    if ranges is None:
-        ranges = PARAM_RANGES_LOCAL
-    raw = torch.tensor([threshold, attack, release, ratio], dtype=torch.float32)
-    for i, key in enumerate(PARAM_ORDER):
-        lo, hi = ranges[key]
-        raw[i] = (raw[i] - lo) / (hi - lo)
-    return raw.clamp(0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -203,39 +171,6 @@ def run_model(
 
 
 # ---------------------------------------------------------------------------
-# Audio loading — mirrors dataset.py:_load_audio exactly
-# ---------------------------------------------------------------------------
-
-
-def load_wav(path: str, target_sr: int) -> np.ndarray:
-    """Load a WAV file as a 1-D float32 numpy array, applying the same
-    preprocessing as the nablafx training dataloader (data.py:_load):
-      1. load normalised float32 audio
-      2. resample to target_sr if needed
-      3. mean across channels → mono (1, T)
-    Returns a 1-D numpy array (T,).
-    """
-    data, sr = sf.read(path, dtype="float32", always_2d=True)
-    x = torch.from_numpy(data.T)  # (channels, frames)
-    if sr != target_sr:
-        x = torchaudio.functional.resample(x, sr, target_sr)
-    x = torch.mean(x, dim=0, keepdim=True)  # mono
-
-    peak = float(x.abs().max())
-    rms = float(x.pow(2).mean().sqrt())
-    rms_db = 20 * np.log10(max(rms, 1e-10))
-    print(
-        f"  [load] {os.path.basename(path)}: "
-        f"sr={sr}→{target_sr}, "
-        f"ch={data.shape[1]}→1, "
-        f"frames={x.shape[-1]}, "
-        f"peak={peak:.4f}, "
-        f"rms={rms_db:.1f} dB"
-    )
-    return x.squeeze(0).numpy()
-
-
-# ---------------------------------------------------------------------------
 # WAV processing
 # ---------------------------------------------------------------------------
 
@@ -262,8 +197,8 @@ def process_wav(
     y_np = y_t.squeeze().numpy()
 
     pred_peak = float(np.abs(y_np).max())
-    pred_rms = 20 * np.log10(max(np.sqrt(np.mean(y_np**2)), 1e-10))
-    print(f"  [pred] frames={len(y_np)}, peak={pred_peak:.4f}, rms={pred_rms:.1f} dB")
+    pred_rms_db = float(rms_to_db(calculate_rms(y_np)))
+    print(f"  [pred] frames={len(y_np)}, peak={pred_peak:.4f}, rms={pred_rms_db:.1f} dB")
 
     stem = os.path.splitext(os.path.basename(wav_path))[0]
     out_wav = os.path.join(output_dir, f"{stem}_output.wav")
@@ -316,7 +251,7 @@ def parse_args():
     )
     p.add_argument("--device", default="cpu", help="Device (cpu, cuda, mps)")
     p.add_argument("--sample_rate", type=int, default=None)
-    p.add_argument("--output_dir", default="B_sota_analysis/eval_output")
+    p.add_argument("--output_dir", default="02_sota_analysis/eval_output")
 
     p.add_argument(
         "--controls",
@@ -379,14 +314,14 @@ def main():
 if __name__ == "__main__":
     main()
     """
-  uv run python B_sota_analysis/eval_nabla_models.py \
+  uv run python 02_sota_analysis/eval_nabla_models.py \
   --ckpt "external/nablafx-for-diffssl-compressor/experiments/TCN_L_TF/dafx/brqmbvok/checkpoints/last.ckpt" \
   --wav "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_normalized/Electrvm_UnmasteredWAV.wav" \
   --target "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_ground_truth/threshold_-12_attack_10_release_0.4_ratio_10/Electrvm-exported.wav" \
   --threshold -12 --attack 10 --release 0.4 --ratio 10 \
   --device mps
 
-  uv run python B_sota_analysis/eval_all_settings.py \
+  uv run python 02_sota_analysis/eval_all_settings.py \
   --ckpt "external/nablafx-for-diffssl-compressor/experiments/TCN_L_TF/dafx/brqmbvok/checkpoints/last.ckpt" \
   --device mps
 

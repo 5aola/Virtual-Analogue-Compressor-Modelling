@@ -8,25 +8,21 @@ Target: normalised GR (dB) [B, 1, T]   (from 1024-sample windowed RMS)
 Loss:   Smooth L1 + temporal-difference (attack/release dynamics)
 
 Usage:
-    python C_initial_GR_pred/train_gr.py                          # defaults
-    python C_initial_GR_pred/train_gr.py --max_epochs 200         # override
-    python C_initial_GR_pred/train_gr.py --data_root /path/to/data --batch_size 8
+    python 03_initial_GR_pred/train_gr.py                          # defaults
+    python 03_initial_GR_pred/train_gr.py --max_epochs 200         # override
+    python 03_initial_GR_pred/train_gr.py --data_root /path/to/data --batch_size 8
 """
 
 import argparse
 import os
-import sys
-
 import torch
 import torch.nn.functional as F
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from nablafx.processors import TCN
 
-from C_initial_GR_pred.gr_dataset import (
+from gr_dataset import (
     GainReductionDataModule,
     DEFAULT_DATA_ROOT,
     DEFAULT_SETTING,
@@ -197,7 +193,7 @@ def main() -> None:
         precision=args.precision,
         callbacks=[ckpt_cb, lr_cb],
         log_every_n_steps=10,
-        default_root_dir="C_initial_GR_pred/lightning_logs",
+        default_root_dir="03_initial_GR_pred/lightning_logs",
     )
 
     trainer.fit(system, dm)

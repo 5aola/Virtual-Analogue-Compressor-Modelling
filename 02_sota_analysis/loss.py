@@ -1,7 +1,7 @@
 """
-B_sota_analysis loss module — re-exports from ``src.losses``.
+SOTA analysis loss module — re-exports from ``src.losses``.
 
-Backward-compatible: ``import loss`` or ``from B_sota_analysis.loss import ...``
+Backward-compatible: ``import loss`` or ``from loss import ...``
 continue to work.
 """
 

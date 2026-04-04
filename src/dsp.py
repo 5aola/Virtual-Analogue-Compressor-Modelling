@@ -1,10 +1,59 @@
 """
-NumPy-based DSP utilities: RMS envelopes, gain reduction, level helpers.
+NumPy-based DSP utilities: RMS envelopes, gain reduction, level helpers,
+compressor-parameter parsing and normalisation.
 """
+
+import re
 
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
+
+
+# ---------------------------------------------------------------------------
+# Compressor parameter constants
+# ---------------------------------------------------------------------------
+
+PARAM_ORDER = ["threshold", "attack", "release", "ratio"]
+
+PARAM_RANGES_LOCAL = {
+    "threshold": (-20.0, 0.0),
+    "attack": (0.1, 30.0),
+    "release": (0.1, 1.6),
+    "ratio": (2.0, 10.0),
+}
+
+PARAM_RANGES_NABLAFX = {
+    "threshold": (-20.0, 20.0),
+    "attack": (0.0, 30.0),
+    "release": (0.0, 1.6),
+    "ratio": (0.0, 10.0),
+}
+
+
+def parse_settings_from_folder_name(folder_name: str) -> dict:
+    """Parse compressor settings from a folder name using individual regex
+    patterns.  Returns dict with keys: threshold, attack, release, ratio
+    (values may be ``None``).
+    """
+    settings: dict = {
+        "threshold": None,
+        "attack": None,
+        "release": None,
+        "ratio": None,
+    }
+    patterns = {
+        "threshold": r"threshold_(-?\d+(?:\.\d+)?)",
+        "attack": r"attack_(-?\d+(?:\.\d+)?)",
+        "release": r"release_(-?\d+(?:\.\d+)?)",
+        "ratio": r"ratio_(-?\d+(?:\.\d+)?)",
+    }
+    for param, pattern in patterns.items():
+        match = re.search(pattern, folder_name, re.IGNORECASE)
+        if match:
+            value = match.group(1)
+            settings[param] = float(value) if "." in value else int(value)
+    return settings
 
 
 # ---------------------------------------------------------------------------

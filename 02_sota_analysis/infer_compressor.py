@@ -7,7 +7,7 @@ Two modes:
 
 Examples:
   # List available models
-  uv run B_sota_analysis/infer_compressor.py --list_models
+  uv run 02_sota_analysis/infer_compressor.py --list_models
 
   # Free-parameter inference
   python infer_compressor.py --model GCN_L_TVF --mode free \
@@ -25,13 +25,19 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "nablafx"))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(__file__), "..", "nablafx")
+)  # local nablafx checkout
 
 import nablafx.processors  # noqa: F401  # for _instantiate_class
 import torch
-import torchaudio
 import yaml
 from nablafx.core import BlackBoxSystem, BlackBoxSystemWithTBPTT, GreyBoxSystem
+
+from src.audio_io import load_wav_tensor
+from src.dsp import PARAM_RANGES_NABLAFX
+from src.dsp_torch import normalize_params
+from dataset import extract_params_from_target_path
 
 EXPERIMENTS_DIR = Path(
     os.path.join(
@@ -50,92 +56,9 @@ SYSTEM_CLASS_MAP = {
     "nablafx.core.GreyBoxSystem": GreyBoxSystem,
 }
 
-# ---------------------------------------------------------------------------
-# Parameter normalization — must match nablafx/data.py (lines 413-417)
-# which was used during training.
-#
-# NOTE: SSLGCompDataset.PARAM_RANGES uses DIFFERENT ranges than data.py.
-#       The models were trained with data.py normalization, so we must use
-#       that exact normalization for inference.
-#
-# Raw param ranges used during training:
-#   threshold ∈ [-20, 20]  → (threshold + 20) / 40
-#   attack    ∈ [0, 30]    → attack / 30
-#   release   ∈ [0, 1.6]   → release / 1.6
-#   ratio     ∈ [0, 10]    → ratio / 10
-# ---------------------------------------------------------------------------
-
-
-def normalize_params(
-    threshold: float, attack: float, release: float, ratio: float
-) -> torch.Tensor:
-    """Normalize raw compressor params to [0,1] matching training normalization in data.py."""
-    return torch.tensor(
-        [
-            (threshold + 20.0) / 40.0,
-            attack / 30.0,
-            release / 1.6,
-            ratio / 10.0,
-        ],
-        dtype=torch.float32,
-    )
-
-
-def parse_settings_from_folder_name(folder_name: str) -> dict:
-    settings = {"threshold": None, "attack": None, "release": None, "ratio": None}
-    patterns = {
-        "threshold": r"threshold_(-?\d+(?:\.\d+)?)",
-        "attack": r"attack_(-?\d+(?:\.\d+)?)",
-        "release": r"release_(-?\d+(?:\.\d+)?)",
-        "ratio": r"ratio_(-?\d+(?:\.\d+)?)",
-    }
-    for param, pattern in patterns.items():
-        match = re.search(pattern, folder_name, re.IGNORECASE)
-        if match:
-            v = match.group(1)
-            settings[param] = float(v) if "." in v else int(v)
-    return settings
-
-
-def extract_params_from_target_path(target_path: str) -> dict:
-    """
-    Extract compressor parameters from a target WAV path.
-    Reuses an inline version of parse_settings_from_folder_name.
-
-    Expected pattern in some parent directory name:
-        threshold_-12_attack_1_release_0.1_ratio_2
-    """
-    # The path may contain the settings in any parent folder
-    parts = Path(target_path).parts
-    for part in parts:
-        settings = parse_settings_from_folder_name(part)
-        if settings.get("threshold") is not None and settings.get("ratio") is not None:
-            return settings
-
-    raise ValueError(
-        f"Could not extract compressor params from target path:\n  {target_path}\n"
-        "Expected a folder name like: threshold_-12_attack_1_release_0.1_ratio_2"
-    )
-
-
 def load_audio(filepath: str, sample_rate: int = 44100) -> torch.Tensor:
     """Load, resample to target rate, and convert to mono. Returns (1, T) tensor."""
-    import soundfile as sf
-
-    data, sr = sf.read(filepath, dtype="float32")  # (T,) or (T, C)
-    x = torch.from_numpy(data)
-    if x.ndim == 1:
-        x = x.unsqueeze(0)  # (1, T)
-    else:
-        x = x.T  # (C, T)
-
-    if sr != sample_rate:
-        x = torchaudio.functional.resample(x, sr, sample_rate)
-
-    if x.shape[0] > 1:
-        x = torch.mean(x, dim=0, keepdim=True)
-
-    return x
+    return load_wav_tensor(filepath, sample_rate)
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +364,7 @@ def main():
         raw_params = extract_params_from_target_path(args.target_wav)
         print(f"Extracted params from target path: {raw_params}")
 
-    # Normalize using training normalization (data.py)
-    controls = normalize_params(**raw_params)
+    controls = normalize_params(**raw_params, ranges=PARAM_RANGES_NABLAFX)
     print(
         f"Raw params:        threshold={raw_params['threshold']}, attack={raw_params['attack']}, "
         f"release={raw_params['release']}, ratio={raw_params['ratio']}"

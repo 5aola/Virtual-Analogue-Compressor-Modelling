@@ -6,12 +6,12 @@ and model-output↔unmastered audio.
 Uses infer_compressor for model loading, param normalization, and inference.
 
 Example:
-uv run B_sota_analysis/loss_evals.py \
+uv run 02_sota_analysis/loss_evals.py \
   "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_normalized/Air_UnmasteredWAV.wav" \
   "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_ground_truth/threshold_-12_attack_1_release_0.1_ratio_2/Air-exported.wav" \
   --model TCN_S_TF
 
-uv run B_sota_analysis/loss_evals.py \
+uv run 02_sota_analysis/loss_evals.py \
   "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_normalized/LivingLie_UnmasteredWAV.wav" \
   "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_ground_truth/threshold_-12_attack_10_release_0.4_ratio_10/LivingLie-exported.wav" \
   --model S4_S_TF
@@ -24,18 +24,19 @@ import sys
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "nablafx"))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(__file__), "..", "nablafx")
+)  # local nablafx checkout for infer_compressor
 
-from B_sota_analysis.infer_compressor import (
+from dataset import extract_params_from_target_path
+from infer_compressor import (
     discover_models,
-    extract_params_from_target_path,
     load_audio,
     load_model,
-    normalize_params,
     run_inference,
 )
-from src.dsp import calc_gain_reduction
+from src.dsp import calc_gain_reduction, to_amplitude, PARAM_RANGES_NABLAFX
+from src.dsp_torch import normalize_params
 from src import losses as loss
 
 
@@ -69,7 +70,7 @@ def calc_losses(
         raw_params = extract_params_from_target_path(target)
         print(f"Extracted params from target path: {raw_params}")
 
-    controls = normalize_params(**raw_params)
+    controls = normalize_params(**raw_params, ranges=PARAM_RANGES_NABLAFX)
     print(
         f"Params: threshold={raw_params['threshold']}, attack={raw_params['attack']}, "
         f"release={raw_params['release']}, ratio={raw_params['ratio']}"
@@ -101,7 +102,7 @@ def calc_losses(
     gr_db = calc_gain_reduction(
         x.squeeze().numpy(), y.squeeze().numpy(), window_size=64
     )
-    gr_linear = np.power(10.0, gr_db / 20.0)  # dB → linear gain
+    gr_linear = to_amplitude(gr_db)
     # The gain-reduction array may differ slightly in length; trim to match
     x_np = x.squeeze().numpy()
     gr_len = min(len(gr_linear), len(x_np))

@@ -11,54 +11,16 @@ and shows the variation across different songs.
 
 import argparse
 import os
-import re
-import sys
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from src.audio_io import load_audio
 from src.dsp import calc_gain_reduction
-
-GT_ROOT = "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_ground_truth"
-INPUT_ROOT = "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_normalized"
-
-SETTING_RE = re.compile(
-    r"^threshold_(?P<threshold>-?\d+(?:\.\d+)?)"
-    r"_attack_(?P<attack>\d+(?:\.\d+)?)"
-    r"_release_(?P<release>\d+(?:\.\d+)?)"
-    r"_ratio_(?P<ratio>\d+(?:\.\d+)?)$"
-)
-
-
-def discover_settings(gt_root: str) -> list[dict]:
-    """Scan gt_root for setting folders and return parsed parameter dicts."""
-    settings = []
-    if not os.path.exists(gt_root):
-        print(f"Warning: GT_ROOT {gt_root} does not exist.")
-        return settings
-        
-    for name in sorted(os.listdir(gt_root)):
-        full = os.path.join(gt_root, name)
-        if not os.path.isdir(full):
-            continue
-        m = SETTING_RE.match(name)
-        if m is None:
-            continue
-            
-        settings.append({
-            "folder_name": name,
-            "path": full,
-            "threshold": float(m.group("threshold")),
-            "attack": float(m.group("attack")),
-            "release": float(m.group("release")),
-            "ratio": float(m.group("ratio")),
-        })
-    return settings
+from dataset import GT_ROOT, INPUT_ROOT, discover_settings
 
 
 def get_all_songs(input_root: str, max_songs: int = None) -> list[str]:
@@ -77,7 +39,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate Dataset Gain Reduction")
     parser.add_argument("--gt-root", default=GT_ROOT, help="Ground truth root directory")
     parser.add_argument("--input-root", default=INPUT_ROOT, help="Input (unmastered) root directory")
-    parser.add_argument("--output-dir", default="B_sota_analysis/eval_output/dataset_gr_eval", help="Output directory for CSV and plots")
+    parser.add_argument("--output-dir", default="02_sota_analysis/eval_output/dataset_gr_eval", help="Output directory for CSV and plots")
     parser.add_argument("--max-songs", type=int, default=None, help="Maximum number of songs to evaluate (for quick testing)")
     parser.add_argument("--window-size", type=int, default=64, help="Window size for RMS/Peak calculation")
     parser.add_argument("--sample-rate", type=int, default=44100, help="Sample rate")

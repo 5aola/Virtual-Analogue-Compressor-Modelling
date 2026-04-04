@@ -11,15 +11,11 @@ Normalisation:  gr_norm = (gr_db - GR_DB_MIN) / (GR_DB_MAX - GR_DB_MIN) * 2 - 1
 
 import os
 import glob
-import sys
-
 import torch
 import torchaudio
 import lightning as pl
 from torch.utils.data import Dataset, DataLoader
 from typing import Optional
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.dsp_torch import (
     GR_DB_MIN,

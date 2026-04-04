@@ -1,7 +1,6 @@
 """
-SSL G-Comp Dataset Loader
-
-Builds a pandas DataFrame with dry/wet audio pairs and parsed compressor settings.
+SSL G-Comp Dataset — shared constants, setting discovery, DataFrame builder,
+and PyTorch Dataset / DataModule.
 
 Dataset structure:
     data_root/
@@ -9,7 +8,7 @@ Dataset structure:
     │   ├── SongName_UnmasteredWAV.wav
     │   └── ...
     └── processed_ground_truth/          # Wet files (y)
-        ├── _threshold_-12_attack_1_release_0.1_ratio_2/
+        ├── threshold_-12_attack_1_release_0.1_ratio_2/
         │   ├── SongName-exported.wav
         │   └── ...
         └── threshold_12_attack_30_release_0.8_ratio_2/
@@ -19,6 +18,7 @@ Dataset structure:
 import glob
 import os
 import re
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import lightning as pl
@@ -27,41 +27,77 @@ import torch
 import torchaudio
 from torch.utils.data import DataLoader, Dataset
 
+from src.dsp import PARAM_RANGES_LOCAL, parse_settings_from_folder_name  # noqa: F401 — re-exported
 
-def parse_settings_from_folder_name(folder_name: str) -> dict:
+# ---------------------------------------------------------------------------
+# Shared constants — used by eval scripts across 02_sota_analysis
+# ---------------------------------------------------------------------------
+
+GT_ROOT = "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_ground_truth"
+INPUT_ROOT = "/Volumes/Saola's Drive/thesis/data/Diff-SSL-G-Comp/processed_normalized"
+INPUT_NAME = "Electrvm_UnmasteredWAV.wav"
+TARGET_NAME = "Electrvm-exported.wav"
+
+SETTING_RE = re.compile(
+    r"^threshold_(?P<threshold>-?\d+(?:\.\d+)?)"
+    r"_attack_(?P<attack>\d+(?:\.\d+)?)"
+    r"_release_(?P<release>\d+(?:\.\d+)?)"
+    r"_ratio_(?P<ratio>\d+(?:\.\d+)?)$"
+)
+
+
+# ---------------------------------------------------------------------------
+# Setting discovery and parsing
+# ---------------------------------------------------------------------------
+
+
+def discover_settings(gt_root: str = GT_ROOT) -> list[dict]:
+    """Scan *gt_root* for folders matching ``SETTING_RE``.
+
+    Returns a list of dicts with keys:
+        ``folder_name``, ``path``, ``threshold``, ``attack``, ``release``, ``ratio``.
     """
-    Parse compressor settings from folder name.
+    settings = []
+    if not os.path.exists(gt_root):
+        print(f"Warning: {gt_root} does not exist.")
+        return settings
 
-    Expected format: '_threshold_-12_attack_1_release_0.1_ratio_2' or similar
-
-    Args:
-        folder_name: Name of the settings folder
-
-    Returns:
-        Dictionary with parsed settings (threshold, attack, release, ratio)
-    """
-    settings = {
-        "threshold": None,
-        "attack": None,
-        "release": None,
-    }
-
-    # Pattern to match: paramname_value pairs
-    # Handle negative values with optional minus sign
-    patterns = {
-        "threshold": r"threshold_(-?\d+(?:\.\d+)?)",
-        "attack": r"attack_(-?\d+(?:\.\d+)?)",
-        "release": r"release_(-?\d+(?:\.\d+)?)",
-        "ratio": r"ratio_(-?\d+(?:\.\d+)?)",
-    }
-
-    for param, pattern in patterns.items():
-        match = re.search(pattern, folder_name, re.IGNORECASE)
-        if match:
-            value = match.group(1)
-            settings[param] = float(value) if "." in value else int(value)
-
+    for name in sorted(os.listdir(gt_root)):
+        full = os.path.join(gt_root, name)
+        if not os.path.isdir(full):
+            continue
+        m = SETTING_RE.match(name)
+        if m is None:
+            continue
+        settings.append(
+            {
+                "folder_name": name,
+                "path": full,
+                "threshold": float(m.group("threshold")),
+                "attack": float(m.group("attack")),
+                "release": float(m.group("release")),
+                "ratio": float(m.group("ratio")),
+            }
+        )
     return settings
+
+
+def extract_params_from_target_path(target_path: str) -> dict:
+    """Extract compressor parameters from a target WAV path.
+
+    Walks parent directory names looking for a folder matching the
+    ``threshold_…_attack_…_release_…_ratio_…`` pattern.
+    """
+    parts = Path(target_path).parts
+    for part in parts:
+        settings = parse_settings_from_folder_name(part)
+        if settings.get("threshold") is not None and settings.get("ratio") is not None:
+            return settings
+
+    raise ValueError(
+        f"Could not extract compressor params from target path:\n  {target_path}\n"
+        "Expected a folder name like: threshold_-12_attack_1_release_0.1_ratio_2"
+    )
 
 
 def get_song_name_from_dry(dry_filename: str) -> str:
@@ -199,7 +235,7 @@ def get_unique_settings(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame with unique settings combinations
     """
-    settings_cols = ["threshold", "attack", "release", "ratio", "settings_folder"]
+    settings_cols = ["threshold", "attack", "release", "ratio"]
     return df[settings_cols].drop_duplicates().reset_index(drop=True)
 
 
@@ -244,7 +280,8 @@ def dataset_summary(df: pd.DataFrame) -> None:
     print("=" * 60)
     print(f"Total pairs: {len(df)}")
     print(f"Unique songs: {df['song_name'].nunique()}")
-    print(f"Unique settings: {df['settings_folder'].nunique()}")
+    n_settings = df[["threshold", "attack", "release", "ratio"]].drop_duplicates().shape[0]
+    print(f"Unique settings: {n_settings}")
     print()
     print("Settings ranges:")
     print(f"  Threshold: {df['threshold'].min()} to {df['threshold'].max()} dB")
@@ -272,13 +309,7 @@ class SSLGCompDataset(Dataset):
         preload: Whether to preload all audio into memory
     """
 
-    # Normalization ranges for parameters (adjust based on your data)
-    PARAM_RANGES = {
-        "threshold": (-20, 0),  # dB range
-        "attack": (0.1, 30),  # ms range
-        "release": (0.1, 1.6),  # seconds range
-        "ratio": (2, 10),  # ratio range
-    }
+    PARAM_RANGES = PARAM_RANGES_LOCAL
 
     def __init__(
         self,
