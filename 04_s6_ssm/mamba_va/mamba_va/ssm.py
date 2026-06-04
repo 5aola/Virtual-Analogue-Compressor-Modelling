@@ -29,6 +29,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .scan import scan_sequential, scan_parallel
 
@@ -99,8 +100,16 @@ class SelectiveSSM(nn.Module):
         b_flat = b.reshape(B, L, D * N)
         h0 = None if state is None else state.reshape(B, D * N)
 
-        scan = scan_parallel if parallel else scan_sequential
-        h_flat, h_last = scan(a_flat, b_flat, h0)
+        if parallel and self.training:
+            # The parallel (Hillis-Steele) scan retains O(log L) intermediate
+            # (B, L, D*N) tensors for backward; across layers that is the bulk of
+            # training memory.  Checkpointing frees them and recomputes the scan
+            # in backward -- O(L log L) -> O(L) memory, forward stays parallel.
+            h_flat, h_last = checkpoint(scan_parallel, a_flat, b_flat, h0,
+                                        use_reentrant=False)
+        else:
+            scan = scan_parallel if parallel else scan_sequential
+            h_flat, h_last = scan(a_flat, b_flat, h0)
         h = h_flat.reshape(B, L, D, N)
 
         y = torch.einsum("bldn,bln->bld", h, Cc) + x * self.D
