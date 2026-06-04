@@ -37,7 +37,7 @@ from infer_compressor import (
 )
 from src.dsp import calc_gain_reduction, to_amplitude, PARAM_RANGES_NABLAFX
 from src.dsp_torch import normalize_params
-from src import losses as loss
+from src.losses import compute_all_losses
 
 
 def calc_losses(
@@ -124,7 +124,7 @@ def calc_losses(
     # Compute losses for all pairs
     results = []
     for label, a, b in pairs:
-        results.append((label, loss.compute_all_losses(a, b)))
+        results.append((label, compute_all_losses(a, b)))
 
     # Print as a table: rows = comparisons, columns = losses
     loss_names = list(results[0][1].keys())

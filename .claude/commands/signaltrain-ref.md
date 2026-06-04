@@ -1,0 +1,1 @@
+Load the SignalTrain project reference for the current task. Read the file .cursor/rules/signaltrain.mdc for the full reference covering: project layout, model architecture (st_model, AsymMPAEC, trainable STFT), effects system, LA2A dataset format, training pipeline, knob conditioning flow, and utility scripts. Use this context to help with the user's current request.

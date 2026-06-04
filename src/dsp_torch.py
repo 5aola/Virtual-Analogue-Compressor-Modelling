@@ -28,18 +28,37 @@ def windowed_rms(signal: torch.Tensor, window_size: int) -> torch.Tensor:
     """Sample-rate windowed RMS via 1-D convolution.
 
     Args:
-        signal: ``[1, T]`` mono audio.
+        signal: ``[T]``, ``[C, T]``, or ``[B, C, T]`` audio.
         window_size: RMS analysis window in samples.
 
     Returns:
-        ``[1, T]`` RMS envelope (linear amplitude).
+        RMS envelope (linear amplitude) with the same rank as ``signal``.
     """
-    sq = (signal.unsqueeze(0)) ** 2
-    kernel = torch.ones(1, 1, window_size, device=signal.device) / window_size
+    orig_ndim = signal.ndim
+    if orig_ndim == 1:
+        sig = signal.view(1, 1, -1)
+    elif orig_ndim == 2:
+        sig = signal.unsqueeze(0)
+    elif orig_ndim == 3:
+        sig = signal
+    else:
+        raise ValueError(f"windowed_rms expects 1/2/3-D input, got {orig_ndim}-D")
+
+    batch, channels, frames = sig.shape
+    sq = sig.reshape(batch * channels, 1, frames) ** 2
+    kernel = (
+        torch.ones(1, 1, window_size, device=sig.device, dtype=sq.dtype)
+        / window_size
+    )
     pad = window_size - 1
-    rms_sq = F.conv1d(sq, kernel, padding=pad)
-    rms_sq = rms_sq[..., : signal.shape[-1]]
-    return torch.sqrt(rms_sq.squeeze(0).clamp(min=1e-10))
+    rms_sq = F.conv1d(sq, kernel, padding=pad)[..., :frames]
+    rms = torch.sqrt(rms_sq.clamp(min=1e-10)).reshape(batch, channels, frames)
+
+    if orig_ndim == 1:
+        return rms.view(-1)
+    if orig_ndim == 2:
+        return rms.squeeze(0)
+    return rms
 
 
 # ---------------------------------------------------------------------------
@@ -53,12 +72,12 @@ def gain_reduction_db(
     """GR in dB = RMS_dB(wet) − RMS_dB(dry).  Negative means compression.
 
     Args:
-        dry: ``[1, T]`` dry (input) audio.
-        wet: ``[1, T]`` wet (compressed output) audio.
+        dry: ``[T]``, ``[C, T]``, or ``[B, C, T]`` dry input audio.
+        wet: matching wet compressed output audio.
         window_size: RMS window size.
 
     Returns:
-        ``[1, T]`` gain-reduction signal in dB.
+        Gain-reduction signal in dB with the same rank as the inputs.
     """
     dry_rms = windowed_rms(dry, window_size)
     wet_rms = windowed_rms(wet, window_size)
@@ -80,6 +99,21 @@ def normalize_gr(gr_db: torch.Tensor) -> torch.Tensor:
 def denormalize_gr(gr_norm: torch.Tensor) -> torch.Tensor:
     """Map ``[-1, 1]`` → ``[GR_DB_MIN, GR_DB_MAX]``."""
     return (gr_norm + 1) / 2 * (GR_DB_MAX - GR_DB_MIN) + GR_DB_MIN
+
+
+def compute_gr_target_norm(
+    dry: torch.Tensor,
+    wet: torch.Tensor,
+    rms_window: int = RMS_WINDOW,
+) -> torch.Tensor:
+    """Exact GR target used by training/evaluation: dB GR → normalised clamp."""
+    gr_db = gain_reduction_db(dry.float(), wet.float(), rms_window)
+    return normalize_gr(gr_db).clamp(-1.0, 1.0)
+
+
+def gr_norm_to_db(gr_norm: torch.Tensor) -> torch.Tensor:
+    """Convert a normalised GR curve back to dB for plotting/evaluation."""
+    return denormalize_gr(gr_norm)
 
 
 # ---------------------------------------------------------------------------
