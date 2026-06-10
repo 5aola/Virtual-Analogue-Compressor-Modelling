@@ -7,7 +7,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from lightning import LightningModule
 
-from gr_target import GR_DB_MAX, GR_DB_MIN, normalize_gr_01
+from gr_target import (
+    GR_DB_MAX,
+    GR_DB_MIN,
+    gr_db_to_soft_target,
+    logits_to_expected_db,
+    logits_to_local_avg_db,
+    normalize_gr_01,
+)
 
 
 class TFiLMGRSystem(LightningModule):
@@ -108,3 +115,103 @@ class TFiLMGRSystem(LightningModule):
             "optimizer": opt,
             "lr_scheduler": {"scheduler": sched, "monitor": "loss/val"},
         }
+
+
+class TFiLMGRBinsSystem(TFiLMGRSystem):
+    """Discretized-head variant with a composite, dry-energy-masked loss:
+
+        loss = BCE(bins, Gaussian soft targets)            CREPE recipe from 03
+             + huber_weight * Huber(decoded dB, target dB)  direct regression
+             + delta_weight * Huber(Δ decoded, Δ target)    attack/release timing
+
+    All terms only count frames whose DRY input is above `energy_floor_db`
+    (RMS dBFS) — GR is a ratio of tiny RMS values in silence/fades and those
+    labels are noise. The Huber/delta terms use the differentiable softmax
+    expectation decode; logged mae_db uses the robust local-average decode.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        lr: float = 1e-3,
+        warmup_frames: int = 4,
+        sigma_bins: float = 2.0,
+        energy_floor_db: float = -60.0,
+        huber_weight: float = 0.1,
+        huber_beta_db: float = 1.0,
+        delta_weight: float = 1.0,
+        scheduler: str = "cosine",
+        max_epochs: int = 800,
+        eta_min: float = 1e-6,
+        lr_patience: int = 20,
+        min_lr: float = 1e-6,
+    ):
+        super().__init__(
+            model=model,
+            lr=lr,
+            warmup_frames=warmup_frames,
+            scheduler=scheduler,
+            max_epochs=max_epochs,
+            eta_min=eta_min,
+            lr_patience=lr_patience,
+            min_lr=min_lr,
+        )
+        self.sigma_bins = sigma_bins
+        self.energy_floor_db = energy_floor_db
+        self.huber_weight = huber_weight
+        self.huber_beta_db = huber_beta_db
+        self.delta_weight = delta_weight
+
+    def _step(self, batch, phase: str):
+        dry, gr_db, params, mask, is_reset = batch
+        if is_reset:
+            self.reset_phase_states(phase)
+
+        self.model.tfilm.hidden_state = self._tfilm_states[phase]
+        logits, lstm_state = self.model(dry, params, self._lstm_states[phase], return_state=True)
+        self._lstm_states[phase] = tuple(s.detach() for s in lstm_state)
+        self._tfilm_states[phase] = tuple(s.detach() for s in self.model.tfilm.hidden_state)
+
+        Tf = logits.shape[-1]
+        gr_frames = F.adaptive_avg_pool1d(gr_db, Tf)                    # [B,1,Tf] dB
+        soft = gr_db_to_soft_target(gr_frames, self.sigma_bins)        # [B,bins,Tf]
+
+        # dry-energy floor: frame RMS dBFS; silent frames have noise GR labels
+        frame_db = 10.0 * torch.log10(F.adaptive_avg_pool1d(dry**2, Tf) + 1e-12)
+        valid = (frame_db > self.energy_floor_db) & mask.view(-1, 1, 1).bool()
+
+        if is_reset and self.warmup_frames > 0:
+            w = self.warmup_frames
+            logits, soft = logits[..., w:], soft[..., w:]
+            gr_frames, valid = gr_frames[..., w:], valid[..., w:]
+
+        n_valid = valid.sum().clamp(min=1)
+
+        bce_el = F.binary_cross_entropy_with_logits(logits, soft, reduction="none")
+        bce = (bce_el * valid).sum() / (n_valid * logits.shape[1])
+
+        pred_db = logits_to_expected_db(logits)                        # differentiable
+        huber_el = F.smooth_l1_loss(pred_db, gr_frames, beta=self.huber_beta_db, reduction="none")
+        huber = (huber_el * valid).sum() / n_valid
+
+        dv = valid[..., 1:] & valid[..., :-1]
+        delta_el = F.smooth_l1_loss(
+            pred_db[..., 1:] - pred_db[..., :-1],
+            gr_frames[..., 1:] - gr_frames[..., :-1],
+            beta=self.huber_beta_db,
+            reduction="none",
+        )
+        delta = (delta_el * dv).sum() / dv.sum().clamp(min=1)
+
+        loss = bce + self.huber_weight * huber + self.delta_weight * delta
+
+        with torch.no_grad():
+            mae_db = ((logits_to_local_avg_db(logits) - gr_frames).abs() * valid).sum() / n_valid
+
+        bs = int(mask.sum())
+        self.log(f"loss/{phase}", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=bs)
+        self.log(f"mae_db/{phase}", mae_db, on_step=False, on_epoch=True, prog_bar=True, batch_size=bs)
+        self.log(f"bce/{phase}", bce, on_step=False, on_epoch=True, batch_size=bs)
+        self.log(f"huber_db/{phase}", huber, on_step=False, on_epoch=True, batch_size=bs)
+        self.log(f"delta_db/{phase}", delta, on_step=False, on_epoch=True, batch_size=bs)
+        return loss

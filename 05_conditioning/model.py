@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from nablafx.processors.components import TFiLM
 
-from gr_target import denormalize_gr_01
+from gr_target import NUM_BINS, denormalize_gr_01, logits_to_local_avg_db
 
 
 class StatefulTFiLMLSTMGR(nn.Module):
@@ -77,6 +77,58 @@ class StatefulTFiLMLSTMGR(nn.Module):
 
     def to_db(self, gr_01: torch.Tensor, sample_len: int | None = None) -> torch.Tensor:
         db = denormalize_gr_01(gr_01)
+        if sample_len is not None:
+            db = F.interpolate(db, size=sample_len, mode="linear", align_corners=False)
+        return db
+
+
+class StatefulTFiLMLSTMGRBins(StatefulTFiLMLSTMGR):
+    """Discretized variant: same trunk, head emits NUM_BINS CREPE-style logits
+    over [GR_DB_MIN, GR_DB_MAX] (0.5 dB resolution) instead of a sigmoid scalar."""
+
+    def __init__(
+        self,
+        hop_size: int = 256,
+        encoder_channels: int = 8,
+        hidden_size: int = 24,
+        tfilm_channels: int = 8,
+        cond_dim: int = 4,
+        tfilm_block_size: int = 8,
+        tfilm_num_layers: int = 1,
+        num_bins: int = NUM_BINS,
+    ):
+        super().__init__(
+            hop_size=hop_size,
+            encoder_channels=encoder_channels,
+            hidden_size=hidden_size,
+            tfilm_channels=tfilm_channels,
+            cond_dim=cond_dim,
+            tfilm_block_size=tfilm_block_size,
+            tfilm_num_layers=tfilm_num_layers,
+        )
+        self.num_bins = num_bins
+        self.head = nn.Conv1d(tfilm_channels, num_bins, kernel_size=1)
+
+    def forward(
+        self,
+        dry: torch.Tensor,
+        params: torch.Tensor,
+        state=None,
+        return_state: bool = False,
+    ):
+        # dry: [B, 1, L]   params: [B, 4]   ->   logits: [B, num_bins, T]
+        x = self.act(self.proj(dry))
+        x = x.transpose(1, 2)
+        x, state = self.lstm(x, state)
+        x = self.dense_mid(x).transpose(1, 2)
+        x = self.tfilm(x, params)
+        logits = self.head(x)
+        if return_state:
+            return logits, state
+        return logits
+
+    def to_db(self, logits: torch.Tensor, sample_len: int | None = None) -> torch.Tensor:
+        db = logits_to_local_avg_db(logits)
         if sample_len is not None:
             db = F.interpolate(db, size=sample_len, mode="linear", align_corners=False)
         return db
