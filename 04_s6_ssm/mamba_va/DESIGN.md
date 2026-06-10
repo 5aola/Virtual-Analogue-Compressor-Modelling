@@ -72,10 +72,27 @@ single parallel pass (verified by `test_streaming_matches_parallel`), so the
 same weights train in parallel and deploy as a streaming processor.
 
 **Numerical stability of the scan.** The parallel scan runs in the *linear*
-domain using the associative monoid `(a,b)∘(a',b') = (a·a', a'·b + b')`, a
-Hillis-Steele inclusive scan. This avoids the log-space `cumprod` trick that
-overflows when decays approach 1 (precisely the long-release regime we care
-about). `test_scan` checks parallel == sequential including carried state.
+domain using the associative monoid `(a,b)∘(a',b') = (a·a', a'·b + b')`. This
+avoids the log-space `cumprod` trick that overflows when decays approach 1
+(precisely the long-release regime we care about). It is a **two-level chunked
+scan**: a Hillis-Steele pass within 64-step chunks (in parallel over all
+chunks), a tiny scan over the per-chunk carries, and one multiply-add to
+broadcast them back — log2(64)+1 full-size rounds instead of log2(L), which
+roughly halves the scan's wall time and backward-graph size at L=4096 (the
+scan is memory-bound). `test_scan` checks parallel == sequential for many
+lengths, including carried state and decays within 1e-5 of 1.
+
+**Time constants must be initialised in physical units.** The painful lesson
+of v0.1: at 44.1 kHz a 0.4 s release means a one-pole coefficient of
+`exp(-1/17640) ≈ 0.999943`. Sigmoid-logit coefficients initialised around
+σ(0..4) = 0.5..0.98 give time constants of 0.03–1.25 ms — three orders of
+magnitude off — and reaching 0.99994 requires climbing into the sigmoid's
+saturated tail. Likewise Mamba's token-scale `Δ ∈ [1e-3, 0.1]` caps the SSM's
+slowest pole at ~23 ms of audio. v0.2 parameterises every detector time
+constant as `coeff = exp(-1/(sr·τ)), τ = exp(log_τ)` with log-spaced init over
+0.1 ms–1.5 s, and initialises `Δ ∈ [1e-5, 1e-2]` so the SSM pole bank spans
+~0.14 ms–2.3 s. The TBPTT window must also cover the slowest dynamics you
+expect to learn (≥ the release time), or backprop never sees them.
 
 ## 3. Tokenization: not necessary — and how the state replaces it
 
@@ -97,13 +114,18 @@ state.
 cooperating stores of state, all carried across chunks and exact under
 streaming:
 
-- **AdaptiveLevelDetector** — a multi-band leaky integrator with *separate,
-  learnable attack and release coefficients* and a soft gate
-  `rising = σ(sharpness·(x_t − env))` selecting between them:
-  `coeff = rising·a_att + (1−rising)·a_rel`, `env = coeff·env + (1−coeff)·x_t`.
-  This is a nonlinear recurrence (the coefficient depends on the state vs.
-  input comparison), and its slow release branch is what holds the
-  program-dependent, multi-second memory. This is the nonlinear `f` from §1.
+- **AdaptiveLevelDetector** — a multi-band leaky integrator over the
+  *normalized-dB level* with separate, learnable, log-τ-parameterised attack
+  and release time constants and a soft gate selecting between them:
+  `rising = σ(k·(x_t − pilot_t))`, `coeff = rising·a_att + (1−rising)·a_rel`,
+  `env = coeff·env + (1−coeff)·x_t`, where `pilot` is a short linear one-pole
+  of the level. Gating on the pilot (input history) rather than on the band's
+  own state keeps each band a *time-varying linear* recurrence the parallel
+  scan solves directly — no per-sample loop — while the composite map
+  level→env stays nonlinear-with-memory: the effective coefficient is a
+  nonlinear functional of the signal history. Its slow release bands hold the
+  program-dependent, second-scale memory. This supplies the nonlinear `f`
+  from §1.
 - **Selective SSM** — the detector envelope is fed in as the selectivity signal,
   so the discretized decay `ā = exp(Δ·A)` becomes a function of the envelope,
   i.e. of signal history. Diagonal `A` with HiPPO-style init gives the linear
@@ -119,7 +141,7 @@ FiLM, so one model covers the whole control surface rather than one setting.
 ## Architecture summary
 
 ```
-u (B,L) ──► |·| ──► AdaptiveLevelDetector ──► env (B,L,n_bands)
+u (B,L) ─► level_db_norm ─► AdaptiveLevelDetector ─► env (B,L,n_bands)
    │                                              │  (selectivity)
    └─► input_proj ─► FiLM(params) ─► [CompSSMBlock × n_layers] ─► RMSNorm ─► GainComputer ─► g_db
                                          (conv → SiLU → SelectiveSSM(sel=env) → gate)         │

@@ -6,7 +6,7 @@ state-space model for nonlinear, time-variant audio effects.
 Signal path:
 
     u_t (scalar)
-      |-- level = |u|  --> AdaptiveLevelDetector --> env_t  (nonlinear memory)
+      |-- level_db_norm(u) --> AdaptiveLevelDetector --> env_t  (nonlinear memory)
       |-- input_proj(u) --> x_t  (B,L,D)
     x_t = FiLM(x_t, params)                      # device-parameter conditioning
     x_t, env_t --> [CompSSMBlock x n_layers]     # SSM clocked by detector
@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 
 from .blocks import CompSSMBlock
-from .detector import AdaptiveLevelDetector
+from .detector import AdaptiveLevelDetector, level_db_norm
 from .film import FiLM
 
 
@@ -59,10 +59,12 @@ class GainComputer(nn.Module):
 class CompSSM(nn.Module):
     def __init__(self, n_params: int = 4, d_model: int = 24, d_state: int = 16,
                  n_layers: int = 3, expand: int = 2, conv_kernel: int = 4,
-                 n_bands: int = 4, max_db: float = 48.0):
+                 n_bands: int = 4, max_db: float = 48.0, sr: float = 44100.0,
+                 dt_min: float = 1e-5, dt_max: float = 1e-2):
         super().__init__()
         self.n_params = n_params
-        self.detector = AdaptiveLevelDetector(n_bands=n_bands)
+        self.sr = float(sr)
+        self.detector = AdaptiveLevelDetector(n_bands=n_bands, sr=sr)
         det_dim = self.detector.out_dim
 
         self.input_proj = nn.Linear(1, d_model)
@@ -70,7 +72,8 @@ class CompSSM(nn.Module):
 
         self.blocks = nn.ModuleList([
             CompSSMBlock(d_model, d_state=d_state, expand=expand,
-                         conv_kernel=conv_kernel, sel_dim=det_dim)
+                         conv_kernel=conv_kernel, sel_dim=det_dim,
+                         dt_min=dt_min, dt_max=dt_max)
             for _ in range(n_layers)
         ])
         self.norm_f = nn.LayerNorm(d_model)
@@ -100,8 +103,9 @@ class CompSSM(nn.Module):
         if params is None:
             params = torch.zeros(B, self.n_params, device=u.device, dtype=u.dtype)
 
-        level = u.abs()
-        env, det_last = self.detector(level, state.get("det"))   # (B,L,n_bands)
+        level = level_db_norm(u)                                 # normalized dB
+        env, det_last = self.detector(level, state.get("det"),
+                                      parallel=parallel)         # (B,L,n_bands)
 
         x = self.input_proj(u.unsqueeze(-1))
         if self.film is not None:

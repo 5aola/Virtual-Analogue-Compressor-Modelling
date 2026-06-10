@@ -80,6 +80,7 @@ def train(args):
         n_params=n_params, d_model=args.d_model, d_state=args.d_state,
         n_layers=args.n_layers, expand=args.expand, conv_kernel=args.conv_kernel,
         n_bands=args.n_bands, max_db=args.max_db,
+        sr=float(getattr(full, "sr", None) or args.sr or 44100),
     ).to(device)
     print(f"model parameters: {count_params(model)}")
 
@@ -121,7 +122,8 @@ def train(args):
             best = val
             bad = 0
             torch.save({"model": model.state_dict(), "args": vars(args),
-                        "n_params": n_params, "val_esr": val},
+                        "n_params": n_params, "val_esr": val,
+                        "sr": float(model.sr)},
                        os.path.join(args.out, "best.pt"))
         else:
             bad += 1
@@ -155,8 +157,10 @@ def build_argparser():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--patience", type=int, default=30)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--seq_len", type=int, default=2048)
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--seq_len", type=int, default=8192,
+                   help="TBPTT gradient window; must cover the device's slowest "
+                        "time constant (e.g. >=0.4 s of samples for a 0.4 s release)")
     p.add_argument("--train_frac", type=float, default=0.9)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")

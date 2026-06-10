@@ -27,6 +27,7 @@ def load_model(ckpt_path, device="cpu"):
         n_params=ck["n_params"], d_model=a["d_model"], d_state=a["d_state"],
         n_layers=a["n_layers"], expand=a["expand"], conv_kernel=a["conv_kernel"],
         n_bands=a["n_bands"], max_db=a["max_db"],
+        sr=ck.get("sr", 44100.0),
     ).to(device)
     model.load_state_dict(ck["model"])
     model.eval()

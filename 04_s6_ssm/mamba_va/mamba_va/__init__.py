@@ -8,7 +8,7 @@ nonlinear state-space realization theory (Shoukry, 2008).
 from .model import CompSSM
 from .blocks import CompSSMBlock
 from .ssm import SelectiveSSM
-from .detector import AdaptiveLevelDetector
+from .detector import AdaptiveLevelDetector, level_db_norm
 from .film import FiLM
 
 __all__ = [
@@ -16,6 +16,7 @@ __all__ = [
     "CompSSMBlock",
     "SelectiveSSM",
     "AdaptiveLevelDetector",
+    "level_db_norm",
     "FiLM",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

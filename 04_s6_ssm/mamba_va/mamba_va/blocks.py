@@ -61,14 +61,16 @@ class CausalDepthwiseConv1d(nn.Module):
 
 class CompSSMBlock(nn.Module):
     def __init__(self, d_model: int, d_state: int = 16, expand: int = 2,
-                 conv_kernel: int = 4, sel_dim: int = 0):
+                 conv_kernel: int = 4, sel_dim: int = 0,
+                 dt_min: float = 1e-5, dt_max: float = 1e-2):
         super().__init__()
         self.d_model = d_model
         self.d_inner = expand * d_model
         self.norm = RMSNorm(d_model)
         self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=False)
         self.conv = CausalDepthwiseConv1d(self.d_inner, conv_kernel)
-        self.ssm = SelectiveSSM(self.d_inner, d_state=d_state, sel_dim=sel_dim)
+        self.ssm = SelectiveSSM(self.d_inner, d_state=d_state, sel_dim=sel_dim,
+                                dt_min=dt_min, dt_max=dt_max)
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
     def forward(self, u, sel=None, state=None, parallel=True):

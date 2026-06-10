@@ -34,7 +34,8 @@ def build_small_ds(sr=8000, seconds=1.0, n=3):
 def run():
     torch.manual_seed(0); np.random.seed(0)
     ds = build_small_ds()
-    model = CompSSM(n_params=4, d_model=16, d_state=8, n_layers=2, n_bands=3)
+    model = CompSSM(n_params=4, d_model=16, d_state=8, n_layers=2, n_bands=3,
+                    sr=ds.sr)
     crit = CombinedLoss()
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 

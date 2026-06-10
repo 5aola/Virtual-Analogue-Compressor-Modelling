@@ -12,6 +12,14 @@ problem. The two headline changes:
    gives the model the *nonlinear* internal memory that the math of system
    realization says a faithful compressor model requires (see `DESIGN.md`).
 
+Since v0.2 every time constant in the model (detector attack/release bands,
+SSM ``Delta`` init) is parameterised and initialised in **physical units at the
+audio sample rate** -- spanning ~0.1 ms to ~2 s -- the level is processed on a
+**normalized dB scale** (compressor gain laws are linear in dB), and the
+detector is solved by the **parallel scan** (two linear passes + an
+input-dependent gate) instead of a per-sample Python loop, which makes it
+~100x faster to train and exactly streamable.
+
 ## Why this is different from a vanilla S6 / Riccardo's Optical-DRC model
 
 | | Riccardo S6 / Optical-DRC | mamba_va |
@@ -65,7 +73,8 @@ PYTHONPATH=. python3 -m mamba_va.infer --ckpt runs/cl1b/best.pt \
 ## Tests
 
 ```bash
-PYTHONPATH=. python3 tests/test_scan.py     # parallel scan == sequential, state carry
+PYTHONPATH=. python3 tests/test_scan.py     # parallel scan == sequential, state carry, chunked lengths
+PYTHONPATH=. python3 tests/test_detector.py # detector: parallel==sequential==streaming, tau mapping
 PYTHONPATH=. python3 tests/test_model.py    # shapes, causality, streaming==parallel, grads
 PYTHONPATH=. python3 tests/smoke_train.py   # a few steps reduce ESR on synthetic data
 ```
@@ -74,19 +83,20 @@ PYTHONPATH=. python3 tests/smoke_train.py   # a few steps reduce ESR on syntheti
 
 ```
 mamba_va/
-  scan.py       parallel (Hillis-Steele) and sequential associative scans
+  scan.py       chunked two-level parallel scan and sequential associative scan
   ssm.py        SelectiveSSM — input-dependent Δ,B,C; detector-driven selectivity
-  detector.py   AdaptiveLevelDetector — nonlinear asymmetric attack/release memory
+  detector.py   AdaptiveLevelDetector — log-τ asymmetric attack/release memory,
+                dB-domain level front end, solved by the parallel scan
   blocks.py     RMSNorm, causal depthwise conv, Mamba-style gated block
   film.py       FiLM conditioning on device parameters
   model.py      CompSSM — full model + streaming render()
-  losses.py     ESR, pre-emphasis ESR, multi-resolution STFT, DC; CombinedLoss
+  losses.py     pooled ESR, pre-emphasis ESR, multi-resolution STFT, DC; CombinedLoss
   data.py       WAV pair dataset, time-split, TBPTT loader
   synth.py      synthetic compressor for smoke tests / no-data training
   train.py      CLI training entry point
   infer.py      CLI streaming inference
   utils.py      state detach, param counting
-tests/          scan / model / smoke-train tests
+tests/          scan / detector / model / smoke-train tests
 ```
 
 See `DESIGN.md` for the theory, the audio-specific challenges, and the

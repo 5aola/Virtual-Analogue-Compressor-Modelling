@@ -36,7 +36,7 @@ from .scan import scan_sequential, scan_parallel
 
 class SelectiveSSM(nn.Module):
     def __init__(self, d_model: int, d_state: int = 16, dt_rank: int | None = None,
-                 sel_dim: int = 0, dt_min: float = 1e-3, dt_max: float = 0.1):
+                 sel_dim: int = 0, dt_min: float = 1e-5, dt_max: float = 1e-2):
         """
         Args:
             d_model: number of channels D.
@@ -44,8 +44,14 @@ class SelectiveSSM(nn.Module):
             dt_rank: rank of the low-rank Delta projection (defaults to ceil(D/16)).
             sel_dim: width of the external selectivity signal fed into Delta
                      (0 disables it and recovers vanilla S6).
-            dt_min/dt_max: initialisation range for the Delta bias so that the
-                     initial time constants span a sensible audio range.
+            dt_min/dt_max: initialisation range for the Delta bias.  Delta is
+                     *per sample*, so with A in -[1..N] the slowest/fastest
+                     pole time constants are 1/(dt_min*1) .. 1/(dt_max*N)
+                     samples.  The defaults give ~0.14 ms .. 2.3 s at
+                     44.1 kHz -- covering a compressor's attack *and* its
+                     program-dependent release.  (Mamba's token-sequence
+                     defaults of 1e-3/0.1 cap the memory at ~23 ms of audio,
+                     which is why v0.1 could not learn the 0.4 s release.)
         """
         super().__init__()
         self.d_model = d_model
@@ -60,7 +66,7 @@ class SelectiveSSM(nn.Module):
         # Delta bias init so softplus(bias) lands in [dt_min, dt_max] (Mamba init)
         dt = torch.exp(
             torch.rand(d_model) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
-        ).clamp(min=1e-4)
+        ).clamp(min=min(dt_min, 1e-4))
         inv_dt = dt + torch.log(-torch.expm1(-dt))  # inverse softplus
         with torch.no_grad():
             self.dt_proj.bias.copy_(inv_dt)

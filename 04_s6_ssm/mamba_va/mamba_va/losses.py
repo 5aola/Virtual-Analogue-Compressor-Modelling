@@ -17,10 +17,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def esr(y_hat, y, eps=1e-8):
+def esr(y_hat, y, eps=1e-8, pooled=True):
+    """Error-to-signal ratio.
+
+    pooled=True (default) divides the *summed* error energy by the *summed*
+    signal energy across the whole batch, so near-silent chunks -- whose
+    per-item denominator is ~0 -- cannot blow up the loss.  This is the right
+    form for short TBPTT chunks of real music.  pooled=False recovers the
+    per-item mean (each item weighted equally regardless of energy).
+    """
     num = torch.sum((y - y_hat) ** 2, dim=-1)
-    den = torch.sum(y ** 2, dim=-1) + eps
-    return (num / den).mean()
+    den = torch.sum(y ** 2, dim=-1)
+    if pooled:
+        return num.sum() / (den.sum() + eps)
+    return (num / (den + eps)).mean()
 
 
 def pre_emphasis(x, coeff=0.95):
