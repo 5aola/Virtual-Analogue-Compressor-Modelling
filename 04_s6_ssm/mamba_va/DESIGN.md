@@ -77,10 +77,22 @@ avoids the log-space `cumprod` trick that overflows when decays approach 1
 (precisely the long-release regime we care about). It is a **two-level chunked
 scan**: a Hillis-Steele pass within 64-step chunks (in parallel over all
 chunks), a tiny scan over the per-chunk carries, and one multiply-add to
-broadcast them back — log2(64)+1 full-size rounds instead of log2(L), which
-roughly halves the scan's wall time and backward-graph size at L=4096 (the
-scan is memory-bound). `test_scan` checks parallel == sequential for many
-lengths, including carried state and decays within 1e-5 of 1.
+broadcast them back — log2(64)+1 full-size rounds instead of log2(L) (the
+scan is memory-bound, so rounds ≈ wall time). `test_scan` checks parallel ==
+sequential for many lengths, including carried state and decays within 1e-5
+of 1.
+
+**Backward is the adjoint, not autograd through the scan.** Backprop *through*
+the scan rounds retains O(log L) full-size tensors per layer — multiple GiB at
+L=16k, the cause of a CUDA OOM on a 15 GB T4 even with activation
+checkpointing. Instead `scan_parallel` is an `autograd.Function` whose
+backward solves the adjoint recurrence `λ_t = g_t + a_{t+1} λ_t+1` with the
+*same* chunked scan run natively in reverse, then `∂L/∂b = λ`,
+`∂L/∂a_t = λ_t h_{t-1}`, `∂L/∂h0 = λ_0 a_0`. Only `a`, `h` (and `h0`) are kept
+for backward; training memory is O(L) with a small constant, and backward
+costs one extra scan instead of a recompute + round-by-round autograd.
+Verified by float64 `gradcheck` and gradient equality against
+autograd-through-the-sequential-loop (`test_scan`).
 
 **Time constants must be initialised in physical units.** The painful lesson
 of v0.1: at 44.1 kHz a 0.4 s release means a one-pole coefficient of

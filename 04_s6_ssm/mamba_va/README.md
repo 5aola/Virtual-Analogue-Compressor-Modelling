@@ -83,7 +83,8 @@ PYTHONPATH=. python3 tests/smoke_train.py   # a few steps reduce ESR on syntheti
 
 ```
 mamba_va/
-  scan.py       chunked two-level parallel scan and sequential associative scan
+  scan.py       chunked two-level parallel scan with analytical adjoint backward,
+                plus the sequential (streaming) scan
   ssm.py        SelectiveSSM — input-dependent Δ,B,C; detector-driven selectivity
   detector.py   AdaptiveLevelDetector — log-τ asymmetric attack/release memory,
                 dB-domain level front end, solved by the parallel scan
