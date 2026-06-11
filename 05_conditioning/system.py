@@ -128,6 +128,16 @@ class TFiLMGRBinsSystem(TFiLMGRSystem):
     (RMS dBFS) — GR is a ratio of tiny RMS values in silence/fades and those
     labels are noise. The Huber/delta terms use the differentiable softmax
     expectation decode; logged mae_db uses the robust local-average decode.
+
+    Optional extras:
+    - `depth_weights` [NUM_BINS]: LDS-style inverse-density weights (from
+      dataset.compute_depth_weights); every loss term is weighted by the
+      weight of its target's depth bin — counters regression-to-the-mean on
+      the rare deep-GR tail.
+    - `cond_dropout`: per-stream probability (train only, sampled at stream
+      start, held for the whole epoch pass) of swapping the knob embedding
+      for the model's learned null embedding — CFG-style conditioning dropout.
+      Requires a model whose forward accepts `cond_drop` (StatefulCondLSTMGRBins).
     """
 
     def __init__(
@@ -140,6 +150,8 @@ class TFiLMGRBinsSystem(TFiLMGRSystem):
         huber_weight: float = 0.1,
         huber_beta_db: float = 1.0,
         delta_weight: float = 1.0,
+        depth_weights: torch.Tensor | None = None,
+        cond_dropout: float = 0.0,
         scheduler: str = "cosine",
         max_epochs: int = 800,
         eta_min: float = 1e-6,
@@ -161,16 +173,44 @@ class TFiLMGRBinsSystem(TFiLMGRSystem):
         self.huber_weight = huber_weight
         self.huber_beta_db = huber_beta_db
         self.delta_weight = delta_weight
+        self.cond_dropout = cond_dropout
+        self.register_buffer(
+            "depth_weights",
+            torch.ones(1) if depth_weights is None else depth_weights.float(),
+        )
+        self._cond_drop: dict[str, torch.Tensor | None] = {"train": None, "val": None, "test": None}
+
+    def reset_phase_states(self, phase: str) -> None:
+        super().reset_phase_states(phase)
+        self._cond_drop[phase] = None
+
+    def _depth_weight(self, gr_frames: torch.Tensor) -> torch.Tensor:
+        n = self.depth_weights.numel()
+        if n == 1:
+            return torch.ones_like(gr_frames)
+        idx = (
+            ((gr_frames - GR_DB_MIN) / (GR_DB_MAX - GR_DB_MIN) * (n - 1))
+            .round().clamp(0, n - 1).long()
+        )
+        return self.depth_weights[idx]
 
     def _step(self, batch, phase: str):
         dry, gr_db, params, mask, is_reset = batch
         if is_reset:
             self.reset_phase_states(phase)
+            if phase == "train" and self.cond_dropout > 0:
+                self._cond_drop[phase] = torch.rand(dry.shape[0], device=dry.device) < self.cond_dropout
 
-        self.model.tfilm.hidden_state = self._tfilm_states[phase]
-        logits, lstm_state = self.model(dry, params, self._lstm_states[phase], return_state=True)
+        tfilm = getattr(self.model, "tfilm", None)
+        if tfilm is not None:
+            tfilm.hidden_state = self._tfilm_states[phase]
+        kwargs = {"cond_drop": self._cond_drop[phase]} if self._cond_drop[phase] is not None else {}
+        logits, lstm_state = self.model(
+            dry, params, self._lstm_states[phase], return_state=True, **kwargs
+        )
         self._lstm_states[phase] = tuple(s.detach() for s in lstm_state)
-        self._tfilm_states[phase] = tuple(s.detach() for s in self.model.tfilm.hidden_state)
+        if tfilm is not None:
+            self._tfilm_states[phase] = tuple(s.detach() for s in tfilm.hidden_state)
 
         Tf = logits.shape[-1]
         gr_frames = F.adaptive_avg_pool1d(gr_db, Tf)                    # [B,1,Tf] dB
@@ -186,22 +226,24 @@ class TFiLMGRBinsSystem(TFiLMGRSystem):
             gr_frames, valid = gr_frames[..., w:], valid[..., w:]
 
         n_valid = valid.sum().clamp(min=1)
+        wv = self._depth_weight(gr_frames) * valid                     # [B,1,Tf]
+        wv_sum = wv.sum().clamp(min=1.0)
 
         bce_el = F.binary_cross_entropy_with_logits(logits, soft, reduction="none")
-        bce = (bce_el * valid).sum() / (n_valid * logits.shape[1])
+        bce = (bce_el * wv).sum() / (wv_sum * logits.shape[1])
 
         pred_db = logits_to_expected_db(logits)                        # differentiable
         huber_el = F.smooth_l1_loss(pred_db, gr_frames, beta=self.huber_beta_db, reduction="none")
-        huber = (huber_el * valid).sum() / n_valid
+        huber = (huber_el * wv).sum() / wv_sum
 
-        dv = valid[..., 1:] & valid[..., :-1]
+        wd = wv[..., 1:] * valid[..., :-1]
         delta_el = F.smooth_l1_loss(
             pred_db[..., 1:] - pred_db[..., :-1],
             gr_frames[..., 1:] - gr_frames[..., :-1],
             beta=self.huber_beta_db,
             reduction="none",
         )
-        delta = (delta_el * dv).sum() / dv.sum().clamp(min=1)
+        delta = (delta_el * wd).sum() / wd.sum().clamp(min=1.0)
 
         loss = bce + self.huber_weight * huber + self.delta_weight * delta
 

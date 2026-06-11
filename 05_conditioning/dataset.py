@@ -9,6 +9,7 @@ from typing import Optional
 import lightning as pl
 import soundfile as sf
 import torch
+import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader, Dataset
 
@@ -218,3 +219,45 @@ class MultiSettingGRDataModule(pl.LightningDataModule):
 
     def test_dataloader(self):
         return self._loader(self.test_dataset)
+
+
+def compute_depth_weights(
+    dataset: StatefulMultiSettingGRDataset,
+    alpha: float = 1.0,
+    smooth_sigma_bins: float = 2.0,
+    clamp_max: float = 10.0,
+    energy_floor_db: float = -60.0,
+    hop: int = HOP_SIZE,
+) -> torch.Tensor:
+    """LDS-style inverse-density weights over GR depth (Yang et al., ICML 2021).
+
+    Histograms the energy-masked frame-rate GR depth of `dataset` over the
+    NUM_BINS grid, smooths it with a Gaussian kernel (label-distribution
+    smoothing), and returns per-bin weights ∝ density^(−alpha), normalised to
+    mean 1 under the data distribution and clamped. Index by target bin.
+    """
+    from gr_target import GR_DB_MAX, GR_DB_MIN, NUM_BINS
+
+    hist = torch.zeros(NUM_BINS)
+    for c in dataset.cache:
+        Tf = c["dry"].shape[-1] // hop
+        g = F.adaptive_avg_pool1d(c["gr_db"][..., : Tf * hop].unsqueeze(0), Tf)[0, 0]
+        e = 10 * torch.log10(
+            F.adaptive_avg_pool1d((c["dry"][..., : Tf * hop] ** 2).unsqueeze(0), Tf) + 1e-12
+        )[0, 0]
+        v = g[e > energy_floor_db]
+        idx = (
+            ((v - GR_DB_MIN) / (GR_DB_MAX - GR_DB_MIN) * (NUM_BINS - 1))
+            .round().clamp(0, NUM_BINS - 1).long()
+        )
+        hist += torch.bincount(idx, minlength=NUM_BINS).float()
+
+    # label-distribution smoothing: convolve the empirical density with a Gaussian
+    half = int(3 * smooth_sigma_bins)
+    k = torch.exp(-0.5 * (torch.arange(-half, half + 1) / smooth_sigma_bins) ** 2)
+    dens = F.conv1d(hist.view(1, 1, -1), (k / k.sum()).view(1, 1, -1), padding=half)[0, 0]
+    dens = (dens / dens.sum()).clamp(min=1e-8)
+
+    w = dens ** -alpha
+    w = w / (w * dens).sum()          # E_data[w] = 1
+    return w.clamp(max=clamp_max)
