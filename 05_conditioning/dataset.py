@@ -145,13 +145,16 @@ class RandomColdStartGRDataset(Dataset):
         target_sec: float = 5.0,
         batch_size: int = 4,
         hop: int = HOP_SIZE,
+        block_size_frames: int = 8,
     ):
         self.base = stateful_dataset
         self.sr = stateful_dataset.sr
         self.hop = hop
+        self.block_size_frames = max(1, int(block_size_frames))
+        self.block_samples = self.hop * self.block_size_frames
         self.batch_size = batch_size
-        self.pre_roll_samples = self._seconds_to_hop_aligned_samples(pre_roll_sec)
-        self.target_samples = self._seconds_to_hop_aligned_samples(target_sec)
+        self.pre_roll_samples = self._seconds_to_block_aligned_samples(pre_roll_sec)
+        self.target_samples = self._seconds_to_block_aligned_samples(target_sec)
         self.window_samples = self.pre_roll_samples + self.target_samples
         self.pre_roll_frames = self.pre_roll_samples // self.hop
         self.valid_rows = [
@@ -167,12 +170,13 @@ class RandomColdStartGRDataset(Dataset):
             f"B={self.batch_size}, window={self.window_samples / self.sr:.1f}s "
             f"(pre-roll={self.pre_roll_samples / self.sr:.1f}s, "
             f"target={self.target_samples / self.sr:.1f}s), "
+            f"block={self.block_size_frames} frames, "
             f"valid_streams={len(self.valid_rows)}"
         )
 
-    def _seconds_to_hop_aligned_samples(self, seconds: float) -> int:
+    def _seconds_to_block_aligned_samples(self, seconds: float) -> int:
         samples = int(round(seconds * self.sr))
-        return max(self.hop, (samples // self.hop) * self.hop)
+        return max(self.block_samples, (samples // self.block_samples) * self.block_samples)
 
     def __len__(self) -> int:
         return len(self.base)
@@ -188,7 +192,8 @@ class RandomColdStartGRDataset(Dataset):
         for r, idx in enumerate(row_idx.tolist()):
             c = self.base.cache[self.valid_rows[idx]]
             max_start = c["dry"].shape[-1] - W
-            start = int(torch.randint(max_start // self.hop + 1, ()).item()) * self.hop
+            start = int(torch.randint(max_start // self.block_samples + 1, ()).item())
+            start *= self.block_samples
             stop = start + W
             dry_b[r] = c["dry"][:, start:stop]
             gr_b[r] = c["gr_db"][:, start:stop]
@@ -207,6 +212,7 @@ class MixedStatefulColdStartGRDataset(Dataset):
         cold_pre_roll_sec: float = 30.0,
         cold_target_sec: float = 5.0,
         cold_batch_size: int = 4,
+        cold_block_size_frames: int = 8,
     ):
         self.stateful = stateful_dataset
         self.cold_batches_per_stateful = max(0, int(cold_batches_per_stateful))
@@ -215,6 +221,7 @@ class MixedStatefulColdStartGRDataset(Dataset):
             pre_roll_sec=cold_pre_roll_sec,
             target_sec=cold_target_sec,
             batch_size=cold_batch_size,
+            block_size_frames=cold_block_size_frames,
         )
         self.cache = stateful_dataset.cache
         self.B = stateful_dataset.B
@@ -252,6 +259,7 @@ class MultiSettingGRDataModule(pl.LightningDataModule):
         cold_start_pre_roll_sec: float = 30.0,
         cold_start_target_sec: float = 5.0,
         cold_start_batch_size: int = 4,
+        cold_start_block_size_frames: int = 8,
     ):
         super().__init__()
         self.data_root = data_root
@@ -266,6 +274,7 @@ class MultiSettingGRDataModule(pl.LightningDataModule):
         self.cold_start_pre_roll_sec = cold_start_pre_roll_sec
         self.cold_start_target_sec = cold_start_target_sec
         self.cold_start_batch_size = cold_start_batch_size
+        self.cold_start_block_size_frames = cold_start_block_size_frames
         self.split: SplitManifest | None = None
         self._meta: dict[str, list[dict]] = {}
         self.train_dataset = None
@@ -318,6 +327,7 @@ class MultiSettingGRDataModule(pl.LightningDataModule):
                     cold_pre_roll_sec=self.cold_start_pre_roll_sec,
                     cold_target_sec=self.cold_start_target_sec,
                     cold_batch_size=self.cold_start_batch_size,
+                    cold_block_size_frames=self.cold_start_block_size_frames,
                 )
             else:
                 self.train_dataset = stateful_train
