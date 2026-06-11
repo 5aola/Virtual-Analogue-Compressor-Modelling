@@ -233,10 +233,36 @@ class TFiLMGRBinsSystem(TFiLMGRSystem):
             if phase == "train" and self.cond_dropout > 0:
                 cond_drop = torch.rand(dry.shape[0], device=dry.device) < self.cond_dropout
         kwargs = {"cond_drop": cond_drop} if cond_drop is not None else {}
+
+        state_in = None if is_cold_start else self._lstm_states[phase]
+        if is_cold_start and batch_warmup_frames is not None and batch_warmup_frames > 0:
+            hop_size = int(getattr(self.model, "hop_size", 1))
+            warmup_samples = batch_warmup_frames * hop_size
+            warmup_samples = min(warmup_samples, max(dry.shape[-1] - hop_size, 0))
+
+            if warmup_samples > 0:
+                dry_warmup = dry[..., :warmup_samples]
+                dry = dry[..., warmup_samples:]
+                gr_db = gr_db[..., warmup_samples:]
+
+                # The pre-roll is context only. Detach it so cold-start training
+                # does not backpropagate through thousands of recurrent frames.
+                with torch.no_grad():
+                    _, state_in = self.model(
+                        dry_warmup,
+                        params,
+                        None,
+                        return_state=True,
+                        **kwargs,
+                    )
+                    state_in = tuple(s.detach() for s in state_in)
+                    if tfilm is not None and tfilm.hidden_state is not None:
+                        tfilm.hidden_state = tuple(s.detach() for s in tfilm.hidden_state)
+
         logits, lstm_state = self.model(
             dry,
             params,
-            None if is_cold_start else self._lstm_states[phase],
+            state_in,
             return_state=True,
             **kwargs,
         )
@@ -255,11 +281,7 @@ class TFiLMGRBinsSystem(TFiLMGRSystem):
         frame_db = 10.0 * torch.log10(F.adaptive_avg_pool1d(dry**2, Tf) + 1e-12)
         valid = (frame_db > self.energy_floor_db) & mask.view(-1, 1, 1).bool()
 
-        warmup_frames = (
-            batch_warmup_frames
-            if batch_warmup_frames is not None
-            else self.warmup_frames if is_reset else 0
-        )
+        warmup_frames = 0 if is_cold_start else self.warmup_frames if is_reset else 0
         if warmup_frames > 0:
             w = min(warmup_frames, max(Tf - 1, 0))
             logits, soft = logits[..., w:], soft[..., w:]
