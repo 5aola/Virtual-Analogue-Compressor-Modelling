@@ -17,6 +17,18 @@ from gr_target import (
 )
 
 
+def _as_bool(value) -> bool:
+    if torch.is_tensor(value):
+        return bool(value.item())
+    return bool(value)
+
+
+def _as_int(value) -> int:
+    if torch.is_tensor(value):
+        return int(value.item())
+    return int(value)
+
+
 class TFiLMGRSystem(LightningModule):
     """Stateful TBPTT across B parallel (song, setting) streams.
 
@@ -58,7 +70,8 @@ class TFiLMGRSystem(LightningModule):
         self._tfilm_states[phase] = None
 
     def _step(self, batch, phase: str):
-        dry, gr_db, params, mask, is_reset = batch
+        dry, gr_db, params, mask, is_reset = batch[:5]
+        is_reset = _as_bool(is_reset)
         if is_reset:
             self.reset_phase_states(phase)
 
@@ -195,22 +208,44 @@ class TFiLMGRBinsSystem(TFiLMGRSystem):
         return self.depth_weights[idx]
 
     def _step(self, batch, phase: str):
-        dry, gr_db, params, mask, is_reset = batch
-        if is_reset:
+        dry, gr_db, params, mask, is_reset = batch[:5]
+        is_reset = _as_bool(is_reset)
+        batch_warmup_frames = None
+        is_cold_start = False
+        if len(batch) >= 7:
+            batch_warmup_frames = _as_int(batch[5])
+            is_cold_start = _as_bool(batch[6])
+
+        if is_reset and not is_cold_start:
             self.reset_phase_states(phase)
             if phase == "train" and self.cond_dropout > 0:
                 self._cond_drop[phase] = torch.rand(dry.shape[0], device=dry.device) < self.cond_dropout
 
         tfilm = getattr(self.model, "tfilm", None)
-        if tfilm is not None:
+        if tfilm is not None and not is_cold_start:
             tfilm.hidden_state = self._tfilm_states[phase]
-        kwargs = {"cond_drop": self._cond_drop[phase]} if self._cond_drop[phase] is not None else {}
+        elif tfilm is not None:
+            tfilm.hidden_state = None
+
+        cond_drop = self._cond_drop[phase]
+        if is_cold_start:
+            cond_drop = None
+            if phase == "train" and self.cond_dropout > 0:
+                cond_drop = torch.rand(dry.shape[0], device=dry.device) < self.cond_dropout
+        kwargs = {"cond_drop": cond_drop} if cond_drop is not None else {}
         logits, lstm_state = self.model(
-            dry, params, self._lstm_states[phase], return_state=True, **kwargs
+            dry,
+            params,
+            None if is_cold_start else self._lstm_states[phase],
+            return_state=True,
+            **kwargs,
         )
-        self._lstm_states[phase] = tuple(s.detach() for s in lstm_state)
-        if tfilm is not None:
+        if not is_cold_start:
+            self._lstm_states[phase] = tuple(s.detach() for s in lstm_state)
+        if tfilm is not None and not is_cold_start:
             self._tfilm_states[phase] = tuple(s.detach() for s in tfilm.hidden_state)
+        elif tfilm is not None:
+            tfilm.hidden_state = None
 
         Tf = logits.shape[-1]
         gr_frames = F.adaptive_avg_pool1d(gr_db, Tf)                    # [B,1,Tf] dB
@@ -220,8 +255,13 @@ class TFiLMGRBinsSystem(TFiLMGRSystem):
         frame_db = 10.0 * torch.log10(F.adaptive_avg_pool1d(dry**2, Tf) + 1e-12)
         valid = (frame_db > self.energy_floor_db) & mask.view(-1, 1, 1).bool()
 
-        if is_reset and self.warmup_frames > 0:
-            w = self.warmup_frames
+        warmup_frames = (
+            batch_warmup_frames
+            if batch_warmup_frames is not None
+            else self.warmup_frames if is_reset else 0
+        )
+        if warmup_frames > 0:
+            w = min(warmup_frames, max(Tf - 1, 0))
             logits, soft = logits[..., w:], soft[..., w:]
             gr_frames, valid = gr_frames[..., w:], valid[..., w:]
 

@@ -129,6 +129,114 @@ class StatefulMultiSettingGRDataset(Dataset):
         return dry_b, gr_b, params_b, mask, (s == 0)
 
 
+class RandomColdStartGRDataset(Dataset):
+    """Random mid-song cold starts with a long no-loss pre-roll.
+
+    Each item samples a small batch of independent (song, setting) streams,
+    resets recurrent state at the sampled offset, and tells the loss to ignore
+    the pre-roll frames. This teaches the model to recover from an empty state
+    without giving up the normal continuous-stream training path.
+    """
+
+    def __init__(
+        self,
+        stateful_dataset: StatefulMultiSettingGRDataset,
+        pre_roll_sec: float = 30.0,
+        target_sec: float = 5.0,
+        batch_size: int = 4,
+        hop: int = HOP_SIZE,
+    ):
+        self.base = stateful_dataset
+        self.sr = stateful_dataset.sr
+        self.hop = hop
+        self.batch_size = batch_size
+        self.pre_roll_samples = self._seconds_to_hop_aligned_samples(pre_roll_sec)
+        self.target_samples = self._seconds_to_hop_aligned_samples(target_sec)
+        self.window_samples = self.pre_roll_samples + self.target_samples
+        self.pre_roll_frames = self.pre_roll_samples // self.hop
+        self.valid_rows = [
+            i for i, c in enumerate(self.base.cache) if c["dry"].shape[-1] >= self.window_samples
+        ]
+        if not self.valid_rows:
+            raise ValueError(
+                f"No streams are long enough for cold-start windows of "
+                f"{self.window_samples / self.sr:.1f}s"
+            )
+        print(
+            "RandomColdStartGRDataset: "
+            f"B={self.batch_size}, window={self.window_samples / self.sr:.1f}s "
+            f"(pre-roll={self.pre_roll_samples / self.sr:.1f}s, "
+            f"target={self.target_samples / self.sr:.1f}s), "
+            f"valid_streams={len(self.valid_rows)}"
+        )
+
+    def _seconds_to_hop_aligned_samples(self, seconds: float) -> int:
+        samples = int(round(seconds * self.sr))
+        return max(self.hop, (samples // self.hop) * self.hop)
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, _: int):
+        B, W = self.batch_size, self.window_samples
+        dry_b = torch.zeros(B, 1, W)
+        gr_b = torch.zeros(B, 1, W)
+        params_b = torch.zeros(B, 4)
+        mask = torch.ones(B)
+
+        row_idx = torch.randint(len(self.valid_rows), (B,))
+        for r, idx in enumerate(row_idx.tolist()):
+            c = self.base.cache[self.valid_rows[idx]]
+            max_start = c["dry"].shape[-1] - W
+            start = int(torch.randint(max_start // self.hop + 1, ()).item()) * self.hop
+            stop = start + W
+            dry_b[r] = c["dry"][:, start:stop]
+            gr_b[r] = c["gr_db"][:, start:stop]
+            params_b[r] = c["params"]
+
+        return dry_b, gr_b, params_b, mask, True, self.pre_roll_frames, True
+
+
+class MixedStatefulColdStartGRDataset(Dataset):
+    """Interleave continuous TBPTT batches with random cold-start batches."""
+
+    def __init__(
+        self,
+        stateful_dataset: StatefulMultiSettingGRDataset,
+        cold_batches_per_stateful: int = 1,
+        cold_pre_roll_sec: float = 30.0,
+        cold_target_sec: float = 5.0,
+        cold_batch_size: int = 4,
+    ):
+        self.stateful = stateful_dataset
+        self.cold_batches_per_stateful = max(0, int(cold_batches_per_stateful))
+        self.cold = RandomColdStartGRDataset(
+            stateful_dataset,
+            pre_roll_sec=cold_pre_roll_sec,
+            target_sec=cold_target_sec,
+            batch_size=cold_batch_size,
+        )
+        self.cache = stateful_dataset.cache
+        self.B = stateful_dataset.B
+        self.K = stateful_dataset.K
+        self.S = stateful_dataset.S
+        self.sr = stateful_dataset.sr
+        print(
+            "MixedStatefulColdStartGRDataset: "
+            f"1 stateful + {self.cold_batches_per_stateful} cold-start batch(es) "
+            "per cycle"
+        )
+
+    def __len__(self) -> int:
+        return len(self.stateful) * (1 + self.cold_batches_per_stateful)
+
+    def __getitem__(self, idx: int):
+        cycle = 1 + self.cold_batches_per_stateful
+        if idx % cycle == 0:
+            return self.stateful[idx // cycle]
+        return self.cold[idx]
+
+
 class MultiSettingGRDataModule(pl.LightningDataModule):
     def __init__(
         self,
@@ -140,6 +248,10 @@ class MultiSettingGRDataModule(pl.LightningDataModule):
         n_val_songs: int = 1,
         n_test_songs: int = 2,
         split_manifest_path: str | None = None,
+        cold_start_batches_per_stateful: int = 0,
+        cold_start_pre_roll_sec: float = 30.0,
+        cold_start_target_sec: float = 5.0,
+        cold_start_batch_size: int = 4,
     ):
         super().__init__()
         self.data_root = data_root
@@ -150,6 +262,10 @@ class MultiSettingGRDataModule(pl.LightningDataModule):
         self.n_val_songs = n_val_songs
         self.n_test_songs = n_test_songs
         self.split_manifest_path = split_manifest_path
+        self.cold_start_batches_per_stateful = cold_start_batches_per_stateful
+        self.cold_start_pre_roll_sec = cold_start_pre_roll_sec
+        self.cold_start_target_sec = cold_start_target_sec
+        self.cold_start_batch_size = cold_start_batch_size
         self.split: SplitManifest | None = None
         self._meta: dict[str, list[dict]] = {}
         self.train_dataset = None
@@ -192,9 +308,19 @@ class MultiSettingGRDataModule(pl.LightningDataModule):
             )
 
         if stage in (None, "fit") and self.train_dataset is None:
-            self.train_dataset = StatefulMultiSettingGRDataset(
+            stateful_train = StatefulMultiSettingGRDataset(
                 self._meta["train"], self.segment_len, self.sample_rate
             )
+            if self.cold_start_batches_per_stateful > 0:
+                self.train_dataset = MixedStatefulColdStartGRDataset(
+                    stateful_train,
+                    cold_batches_per_stateful=self.cold_start_batches_per_stateful,
+                    cold_pre_roll_sec=self.cold_start_pre_roll_sec,
+                    cold_target_sec=self.cold_start_target_sec,
+                    cold_batch_size=self.cold_start_batch_size,
+                )
+            else:
+                self.train_dataset = stateful_train
         if stage in (None, "fit", "validate") and self.val_dataset is None:
             self.val_dataset = StatefulMultiSettingGRDataset(
                 self._meta["val"], self.segment_len, self.sample_rate
