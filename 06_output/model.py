@@ -2,11 +2,13 @@
 
 Architecture — a faithful port of the Optical-DRC ``create_model_LSTM``
 (Simionato et al., JAES 2025; see ``02b_sota_training``) with conditioning
-removed and a single output layer, plus the PReLU conv front-end from the
-``03_initial_GR_pred`` compact stateful model:
+removed and a single output layer. The conv front-end activation is selectable
+(``encoder_activation``): ``"none"`` reproduces the SOTA ``02b`` baseline
+exactly, while ``"prelu"`` adds the nonlinearity from the ``03_initial_GR_pred``
+compact stateful model:
 
     amp-matched [B,1,S+w-1]
-      → Conv1d(1→C, k=window, s=1) → PReLU      windowed encoder (sample rate)
+      → Conv1d(1→C, k=window, s=1) → act       windowed encoder (sample rate)
         → LSTM(C→H)   ── state carried chunk→chunk (stateful TBPTT) ──┐
           → Linear(H→C2)                                              │
             → LSTM(C2→H) ── state carried chunk→chunk ────────────────┘
@@ -40,19 +42,28 @@ class OutputTransformerLSTM(nn.Module):
         num_lstm_layers: int = 2,
         output_mode: str = "residual_add",
         out_activation: str = "none",
+        encoder_activation: str = "prelu",
     ):
         super().__init__()
         if output_mode not in ("residual_add", "residual_gain", "direct"):
             raise ValueError(f"unknown output_mode: {output_mode}")
         if num_lstm_layers not in (1, 2):
             raise ValueError("num_lstm_layers must be 1 or 2")
+        if encoder_activation not in ("prelu", "tanh", "none"):
+            raise ValueError(f"unknown encoder_activation: {encoder_activation}")
         self.window = window
         self.output_mode = output_mode
         self.num_lstm_layers = num_lstm_layers
 
         # stride=1 windowed conv: each step sees `window` samples (no downsampling)
         self.proj = nn.Conv1d(1, encoder_channels, kernel_size=window, stride=1)
-        self.act = nn.PReLU(encoder_channels)
+        # "none" reproduces the 02b SOTA baseline (bare Conv1d, no nonlinearity)
+        if encoder_activation == "prelu":
+            self.act = nn.PReLU(encoder_channels)
+        elif encoder_activation == "tanh":
+            self.act = nn.Tanh()
+        else:  # none
+            self.act = nn.Identity()
         self.lstm1 = nn.LSTM(encoder_channels, hidden_size, batch_first=True)
         if num_lstm_layers == 2:
             self.dense_mid = nn.Linear(hidden_size, mid_channels)
