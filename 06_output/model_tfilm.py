@@ -82,6 +82,22 @@ class GRFilmConditioner(nn.Module):
         self.tvfilm = TVFiLMMod(
             nfeatures=nfeatures, cond_dim=cond_channels, block_size=block_size
         )
+        self._init_identity(nfeatures)
+
+    def _init_identity(self, nfeatures: int) -> None:
+        """Start the FiLM as an exact no-op (g=1, b=0).
+
+        ``TVFiLMMod`` modulates ``x_out = x_in * g + b`` where ``(g, b)`` are the
+        two halves of the 1x1-conv adaptor output. Default random init would apply
+        a *random* affine to the LSTM features at step 0 — and keep changing it —
+        which the residual head then has to learn through, badly slowing
+        convergence. Zero the adaptor weight and set its bias so g=1, b=0: the
+        layer begins as identity (matching the unconditioned baseline) and learns
+        GR modulation gradually."""
+        with torch.no_grad():
+            nn.init.zeros_(self.tvfilm.adaptor.weight)
+            nn.init.zeros_(self.tvfilm.adaptor.bias)
+            self.tvfilm.adaptor.bias[:nfeatures] = 1.0  # g = 1 (first half); b = 0
 
     def forward(self, x: torch.Tensor, gr_db: torch.Tensor) -> torch.Tensor:
         # x: [B, nfeatures, S]   gr_db: [B, 1, S]  (sample-aligned)
