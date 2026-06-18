@@ -95,14 +95,21 @@ class OutputTransformerSystem(LightningModule):
     def reset_phase_state(self, phase: str) -> None:
         self._states[phase] = None
 
-    def _step(self, batch, phase: str):
+    def _run_model(self, batch, phase: str):
+        """Unpack the batch, run the (stateful) model, carry+detach state.
+
+        Returns ``(pred, wet, mask, is_reset)``. Subclasses with extra inputs
+        (e.g. a GR conditioning curve) override only this method."""
         x, wet, mask, is_reset = batch[:4]
         is_reset = _as_bool(is_reset)
         if is_reset:
             self.reset_phase_state(phase)
-
         pred, new_state = self.model(x, self._states[phase], return_state=True)  # [B,1,S]
         self._states[phase] = _detach_state(new_state)
+        return pred, wet, mask, is_reset
+
+    def _step(self, batch, phase: str):
+        pred, wet, mask, is_reset = self._run_model(batch, phase)
 
         if is_reset and self.warmup_samples > 0:
             w = min(self.warmup_samples, max(pred.shape[-1] - 1, 0))

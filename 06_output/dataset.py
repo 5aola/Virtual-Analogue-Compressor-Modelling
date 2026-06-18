@@ -177,6 +177,10 @@ class OutputTransformerDataModule(pl.LightningDataModule):
     """Same split as ``05_conditioning`` (seed 42, n_val=1, n_test=2; test =
     held-out songs × lowest-threshold settings)."""
 
+    # subclasses (e.g. the GR-conditioned variant) override this to swap in a
+    # dataset that returns extra tensors; the split logic stays shared.
+    dataset_cls = StatefulOutputTransformerDataset
+
     def __init__(
         self,
         data_root: str,
@@ -240,15 +244,15 @@ class OutputTransformerDataModule(pl.LightningDataModule):
             )
 
         if stage in (None, "fit") and self.train_dataset is None:
-            self.train_dataset = StatefulOutputTransformerDataset(
+            self.train_dataset = self.dataset_cls(
                 self._meta["train"], self.segment_len, self.window, self.sample_rate
             )
         if stage in (None, "fit", "validate") and self.val_dataset is None:
-            self.val_dataset = StatefulOutputTransformerDataset(
+            self.val_dataset = self.dataset_cls(
                 self._meta["val"], self.segment_len, self.window, self.sample_rate
             )
         if stage in (None, "test") and self.test_dataset is None:
-            self.test_dataset = StatefulOutputTransformerDataset(
+            self.test_dataset = self.dataset_cls(
                 self._meta["test"], self.segment_len, self.window, self.sample_rate
             )
 
