@@ -1,10 +1,9 @@
-"""Lightning system for diffssl ``LSTM`` (tvcond) with stateful TBPTT.
+"""Lightning system mirroring diffssl ``BlackBoxSystemWithTBPTT``.
 
-Mirrors ``BlackBoxSystemWithTBPTT`` from the diffssl/nablafx recipe (manual
-optim, ``step_num_samples``
-sub-steps, ``detach_states`` after each train step) while feeding the
-multi-stream stateful dataloader from ``dataset.py`` (LSTM state carries across
-consecutive ``segment_len`` chunks of each track; reset when ``is_reset``).
+Per batch: ``reset_states()`` → TBPTT sub-steps of ``step_num_samples`` with
+manual ``backward`` / ``step`` / ``detach_states()`` on train → log loss on the
+full concatenated crop (diffssl ``loss/{phase}/tot`` recipe, logged as
+``loss/{phase}`` here).
 """
 
 from __future__ import annotations
@@ -22,10 +21,6 @@ def esr_metric(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
 
 def rmse_metric(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     return torch.mean(torch.abs(torch.abs(y_pred) - torch.abs(y_true)))
-
-
-def _as_bool(value) -> bool:
-    return bool(value.item()) if torch.is_tensor(value) else bool(value)
 
 
 class DiffSSLTVCLSTMSystem(LightningModule):
@@ -59,63 +54,46 @@ class DiffSSLTVCLSTMSystem(LightningModule):
             w_lin_mag=0.0,
         )
 
-    def _loss_on_valid(self, pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor):
-        pv, tv = pred[valid], target[valid]
-        td = self.l1(pv, tv)
-        fd = self.mrstft(pv, tv)
+    def _loss(self, pred: torch.Tensor, target: torch.Tensor):
+        td = self.l1(pred, target)
+        fd = self.mrstft(pred, target)
         return self.td_weight * td + self.fd_weight * fd, td, fd
 
-    def _process_segment(self, dry, wet, params, mask, phase: str, is_reset: bool):
-        if is_reset:
-            self.model.reset_states()
+    def _common_step(self, batch, phase: str):
+        dry, wet, params = batch
+        train = phase == "train"
 
-        valid = mask.bool()
+        self.model.reset_states()
+        if train:
+            self.model.detach_states()
+            optimizer = self.optimizers()
+            optimizer.zero_grad()
+
         seq_len = dry.shape[-1]
         pred_chunks: list[torch.Tensor] = []
-        train_losses: list[torch.Tensor] = []
-
-        if phase == "train":
-            self.model.detach_states()
-            opt = self.optimizers()
 
         for start in range(0, seq_len, self.step_num_samples):
             end = min(start + self.step_num_samples, seq_len)
-            step_in = dry[..., start:end]
-            step_tgt = wet[..., start:end]
-            pred = self.model(step_in, params)
-            pred_chunks.append(pred)
+            step_pred = self.model(dry[..., start:end], params)
+            pred_chunks.append(step_pred)
 
-            if phase == "train":
-                step_loss, _, _ = self._loss_on_valid(pred, step_tgt, valid)
-                opt.zero_grad()
+            if train:
+                step_loss, _, _ = self._loss(step_pred, wet[..., start:end])
                 self.manual_backward(step_loss)
-                opt.step()
+                optimizer.step()
                 self.model.detach_states()
-                train_losses.append(step_loss.detach())
+                optimizer.zero_grad()
 
-        pred_full = torch.cat(pred_chunks, dim=-1)
-        if phase == "train" and train_losses:
-            loss = torch.stack(train_losses).mean()
-            _, td, fd = self._loss_on_valid(pred_full, wet, valid)
-        else:
-            loss, td, fd = self._loss_on_valid(pred_full, wet, valid)
+        pred = torch.cat(pred_chunks, dim=-1)
+        loss, td, fd = self._loss(pred, wet)
 
         with torch.no_grad():
-            pv, tv = pred_full[valid], wet[valid]
-            mae = F.l1_loss(pv, tv)
-            mse = F.mse_loss(pv, tv)
-            esr = esr_metric(tv, pv)
-            rmse = rmse_metric(tv, pv)
+            mae = F.l1_loss(pred, wet)
+            mse = F.mse_loss(pred, wet)
+            esr = esr_metric(wet, pred)
+            rmse = rmse_metric(wet, pred)
 
-        return loss, td, fd, mae, mse, esr, rmse
-
-    def _step(self, batch, phase: str):
-        dry, wet, params, mask, is_reset = batch
-        is_reset = _as_bool(is_reset)
-        loss, td, fd, mae, mse, esr, rmse = self._process_segment(
-            dry, wet, params, mask, phase, is_reset
-        )
-        bs = int(mask.sum())
+        bs = dry.shape[0]
         self.log(f"loss/{phase}", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=bs)
         self.log(f"loss/{phase}_td", td, on_step=False, on_epoch=True, batch_size=bs)
         self.log(f"loss/{phase}_fd", fd, on_step=False, on_epoch=True, batch_size=bs)
@@ -126,29 +104,20 @@ class DiffSSLTVCLSTMSystem(LightningModule):
             esr,
             on_step=False,
             on_epoch=True,
-            prog_bar=(phase != "train"),
+            prog_bar=(not train),
             batch_size=bs,
         )
         self.log(f"rmse/{phase}", rmse, on_step=False, on_epoch=True, batch_size=bs)
         return loss
 
     def training_step(self, batch, batch_idx):
-        return self._step(batch, "train")
+        return self._common_step(batch, "train")
 
     def validation_step(self, batch, batch_idx):
-        return self._step(batch, "val")
+        return self._common_step(batch, "val")
 
     def test_step(self, batch, batch_idx):
-        return self._step(batch, "test")
-
-    def on_train_epoch_start(self):
-        self.model.reset_states()
-
-    def on_validation_epoch_start(self):
-        self.model.reset_states()
-
-    def on_test_epoch_start(self):
-        self.model.reset_states()
+        return self._common_step(batch, "test")
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.999), eps=1e-8)

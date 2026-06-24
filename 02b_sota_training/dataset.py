@@ -1,8 +1,13 @@
-"""Multi-setting stateful dry→wet dataset for diffssl TVC-LSTM training.
+"""diffssl-style crop dataloader with a custom pair inventory + split.
 
-Uses the same (song, setting) inventory and ``splits.build_split_manifest`` as
-``05_conditioning/train_lstm_tfilm_gr.ipynb`` (GR curves gate which pairs exist),
-but targets are **wet WAVs** for direct audio→audio modelling.
+**Kept different from diffssl** (ablation contract):
+  - pair inventory: 10 settings × 10 songs (`discover_diffssl_wet_pairs`)
+  - split: ``splits.build_split_manifest`` (seed 42, same as TFiLM GR notebook)
+
+**Matched to diffssl** ``DryWetFilesPluginDataModule`` / ``ParametricPluginDataset``:
+  - non-overlapping ``sample_length`` crops (default 132300 = 3 s @ 44.1 kHz)
+  - ``batch_size=16``, train shuffle + ``drop_last``
+  - fresh crop per ``__getitem__`` (no cross-batch LSTM state)
 """
 
 from __future__ import annotations
@@ -25,7 +30,8 @@ from splits import (
 )
 
 SAMPLE_RATE = 44100
-SEGMENT_LEN = 32768
+SAMPLE_LENGTH = 132300  # diffssl LSTM32TVC: 3 s @ 44.1 kHz
+BATCH_SIZE = 16
 
 
 def discover_diffssl_wet_pairs(data_root: str) -> list[dict]:
@@ -60,106 +66,111 @@ def discover_diffssl_wet_pairs(data_root: str) -> list[dict]:
     return sorted(pairs, key=lambda p: (p["song"], p["setting"]))
 
 
-class StatefulMultiSettingWetDataset(Dataset):
-    """One item == one TBPTT step across B parallel (song, setting) streams."""
+class DiffSSLCropDataset(Dataset):
+    """One item == one aligned dry/wet crop + static params (diffssl chunk index)."""
 
     def __init__(
         self,
         pair_meta: list[dict],
-        segment_len: int = SEGMENT_LEN,
+        sample_length: int = SAMPLE_LENGTH,
         sample_rate: int = SAMPLE_RATE,
     ):
-        self.S = segment_len
-        self.sr = sample_rate
-        dry_by_song: dict[str, torch.Tensor] = {}
-        self.cache: list[dict] = []
+        self.sample_length = sample_length
+        self.sample_rate = sample_rate
+        self.samples: list[dict] = []
 
         for m in pair_meta:
-            if m["song"] not in dry_by_song:
-                dry_by_song[m["song"]] = self._load_audio(m["dry"])
-            dry = dry_by_song[m["song"]]
-            wet = self._load_audio(m["wet"])
-            n = min(dry.shape[-1], wet.shape[-1])
-            n -= n % self.S
-            if n < self.S:
+            try:
+                dry_frames = sf.info(m["dry"]).frames
+                wet_frames = sf.info(m["wet"]).frames
+            except (RuntimeError, OSError) as e:
+                print(f"Skipping pair {m['song']}::{m['setting']}: {e}")
                 continue
-            self.cache.append(
-                {
-                    "song": m["song"],
-                    "setting": m["setting"],
-                    "params": torch.tensor(m["params"], dtype=torch.float32),
-                    "dry": dry[..., :n].contiguous(),
-                    "wet": wet[..., :n].contiguous(),
-                    "K": n // self.S,
-                }
-            )
 
-        self.B = len(self.cache)
-        self.K = max((c["K"] for c in self.cache), default=0)
-        ram = (
-            sum(d.numel() for d in dry_by_song.values())
-            + sum(c["wet"].numel() for c in self.cache)
-        ) * 4 / 1024**2
+            num_frames = min(dry_frames, wet_frames)
+            n_chunks = num_frames // sample_length
+            if n_chunks == 0:
+                continue
+
+            params = torch.tensor(m["params"], dtype=torch.float32)
+            for n in range(n_chunks):
+                self.samples.append(
+                    {
+                        "dry": m["dry"],
+                        "wet": m["wet"],
+                        "offset": n * sample_length,
+                        "params": params,
+                    }
+                )
+
+        minutes = len(self.samples) * sample_length / sample_rate / 60.0
         print(
-            f"StatefulMultiSettingWetDataset: B={self.B} streams "
-            f"({len(dry_by_song)} songs), {self.K} steps/epoch, {ram:.0f} MB  "
-            f"[segment_len={self.S}]"
+            f"DiffSSLCropDataset: {len(self.samples)} crops "
+            f"from {len(pair_meta)} pairs  "
+            f"[sample_length={sample_length}, {minutes:.1f} min audio]"
         )
 
-    def _load_audio(self, path: str) -> torch.Tensor:
-        audio, sr = sf.read(path, dtype="float32", always_2d=True)
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _load_slice(self, path: str, offset: int) -> torch.Tensor:
+        audio, sr = sf.read(
+            path,
+            start=offset,
+            stop=offset + self.sample_length,
+            dtype="float32",
+            always_2d=True,
+        )
         x = torch.from_numpy(audio.T)
-        if sr != self.sr:
-            x = torchaudio.functional.resample(x, sr, self.sr)
+        if sr != self.sample_rate:
+            x = torchaudio.functional.resample(x, sr, self.sample_rate)
+            if x.shape[-1] > self.sample_length:
+                x = x[..., : self.sample_length]
+            elif x.shape[-1] < self.sample_length:
+                x = torch.nn.functional.pad(x, (0, self.sample_length - x.shape[-1]))
         if x.shape[0] > 1:
             x = x.mean(dim=0, keepdim=True)
         return x
 
-    def __len__(self) -> int:
-        return self.K
-
-    def __getitem__(self, s: int):
-        S, B = self.S, self.B
-        dry_b = torch.zeros(B, 1, S)
-        wet_b = torch.zeros(B, 1, S)
-        params_b = torch.zeros(B, 4)
-        mask = torch.zeros(B)
-        for r, c in enumerate(self.cache):
-            if s < c["K"]:
-                o = s * S
-                dry_b[r] = c["dry"][:, o : o + S]
-                wet_b[r] = c["wet"][:, o : o + S]
-                params_b[r] = c["params"]
-                mask[r] = 1.0
-        return dry_b, wet_b, params_b, mask, (s == 0)
+    def __getitem__(self, idx: int):
+        s = self.samples[idx]
+        dry = self._load_slice(s["dry"], s["offset"])
+        wet = self._load_slice(s["wet"], s["offset"])
+        return dry, wet, s["params"]
 
 
-class MultiSettingWetDataModule(pl.LightningDataModule):
+class DiffSSLCropDataModule(pl.LightningDataModule):
+    """Custom split manifest + diffssl crop/batch recipe."""
+
     def __init__(
         self,
         data_root: str,
-        segment_len: int = SEGMENT_LEN,
+        sample_length: int = SAMPLE_LENGTH,
         sample_rate: int = SAMPLE_RATE,
+        batch_size: int = BATCH_SIZE,
         split_seed: int = 42,
         n_train_songs: int | None = None,
         n_val_songs: int = 1,
         n_test_songs: int = 2,
         split_manifest_path: str | None = None,
+        num_workers: int = 0,
     ):
         super().__init__()
         self.data_root = data_root
-        self.segment_len = segment_len
+        self.sample_length = sample_length
         self.sample_rate = sample_rate
+        self.batch_size = batch_size
         self.split_seed = split_seed
         self.n_train_songs = n_train_songs
         self.n_val_songs = n_val_songs
         self.n_test_songs = n_test_songs
         self.split_manifest_path = split_manifest_path
+        self.num_workers = num_workers
         self.split: SplitManifest | None = None
         self._meta: dict[str, list[dict]] = {}
-        self.train_dataset = None
-        self.val_dataset = None
-        self.test_dataset = None
+        self.train_dataset: DiffSSLCropDataset | None = None
+        self.val_dataset: DiffSSLCropDataset | None = None
+        self.test_dataset: DiffSSLCropDataset | None = None
 
     def setup(self, stage: Optional[str] = None) -> None:
         if self.split is None:
@@ -196,28 +207,42 @@ class MultiSettingWetDataModule(pl.LightningDataModule):
             )
 
         if stage in (None, "fit") and self.train_dataset is None:
-            self.train_dataset = StatefulMultiSettingWetDataset(
-                self._meta["train"], self.segment_len, self.sample_rate
+            self.train_dataset = DiffSSLCropDataset(
+                self._meta["train"], self.sample_length, self.sample_rate
             )
         if stage in (None, "fit", "validate") and self.val_dataset is None:
-            self.val_dataset = StatefulMultiSettingWetDataset(
-                self._meta["val"], self.segment_len, self.sample_rate
+            self.val_dataset = DiffSSLCropDataset(
+                self._meta["val"], self.sample_length, self.sample_rate
             )
         if stage in (None, "test") and self.test_dataset is None:
-            self.test_dataset = StatefulMultiSettingWetDataset(
-                self._meta["test"], self.segment_len, self.sample_rate
+            self.test_dataset = DiffSSLCropDataset(
+                self._meta["test"], self.sample_length, self.sample_rate
             )
 
-    def _loader(self, dataset):
+    def train_dataloader(self):
         return DataLoader(
-            dataset, batch_size=None, shuffle=False, num_workers=0, pin_memory=True
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
         )
 
-    def train_dataloader(self):
-        return self._loader(self.train_dataset)
-
     def val_dataloader(self):
-        return self._loader(self.val_dataset)
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
 
     def test_dataloader(self):
-        return self._loader(self.test_dataset)
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
