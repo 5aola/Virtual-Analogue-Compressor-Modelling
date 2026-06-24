@@ -1,7 +1,7 @@
 """Lightning system for diffssl ``LSTM`` (tvcond) with stateful TBPTT.
 
-Mirrors ``BlackBoxSystemWithTBPTT`` from
-``external/nablafx-for-diffssl-compressor`` (manual optim, ``step_num_samples``
+Mirrors ``BlackBoxSystemWithTBPTT`` from the diffssl/nablafx recipe (manual
+optim, ``step_num_samples``
 sub-steps, ``detach_states`` after each train step) while feeding the
 multi-stream stateful dataloader from ``dataset.py`` (LSTM state carries across
 consecutive ``segment_len`` chunks of each track; reset when ``is_reset``).
