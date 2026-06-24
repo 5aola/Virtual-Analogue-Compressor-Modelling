@@ -219,14 +219,23 @@ class DiffSSLCropDataModule(pl.LightningDataModule):
                 self._meta["test"], self.sample_length, self.sample_rate
             )
 
+    def _loader_kwargs(self) -> dict:
+        # Keep workers alive across epochs and prefetch ahead so the GPU never
+        # waits on the per-item soundfile seeks (dry + wet). No effect when
+        # num_workers == 0 (single-process loading).
+        kw = dict(num_workers=self.num_workers, pin_memory=True)
+        if self.num_workers > 0:
+            kw["persistent_workers"] = True
+            kw["prefetch_factor"] = 4
+        return kw
+
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             drop_last=True,
-            num_workers=self.num_workers,
-            pin_memory=True,
+            **self._loader_kwargs(),
         )
 
     def val_dataloader(self):
@@ -234,8 +243,7 @@ class DiffSSLCropDataModule(pl.LightningDataModule):
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
+            **self._loader_kwargs(),
         )
 
     def test_dataloader(self):
@@ -243,6 +251,5 @@ class DiffSSLCropDataModule(pl.LightningDataModule):
             self.test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
+            **self._loader_kwargs(),
         )

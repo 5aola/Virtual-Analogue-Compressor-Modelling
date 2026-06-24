@@ -116,6 +116,14 @@ class DiffSSLTVCLSTMSystem(LightningModule):
     def validation_step(self, batch, batch_idx):
         return self._common_step(batch, "val")
 
+    def on_validation_epoch_end(self):
+        # automatic_optimization=False → Lightning will not step the scheduler
+        # for us, so drive ReduceLROnPlateau manually (matches diffssl
+        # BlackBoxSystemWithTBPTT.on_validation_epoch_end).
+        sch = self.lr_schedulers()
+        if sch is not None and "loss/val" in self.trainer.logged_metrics:
+            sch.step(self.trainer.logged_metrics["loss/val"])
+
     def test_step(self, batch, batch_idx):
         return self._common_step(batch, "test")
 
