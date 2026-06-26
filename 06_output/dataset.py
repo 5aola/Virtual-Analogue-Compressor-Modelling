@@ -117,21 +117,28 @@ class StatefulOutputTransformerDataset(Dataset):
             n = min(dry.shape[-1], gr_db.shape[-1], wet.shape[-1])
             if n < self.S:
                 continue
+            gr_db = gr_db[..., :n].contiguous()
             self.cache.append(
                 {
                     "song": m["song"],
                     "setting": m["setting"],
-                    "gr_db": gr_db[..., :n].contiguous(),
+                    "gr_db": gr_db,
                     "wet": wet[..., :n].contiguous(),
+                    # Precompute the amplitude-matched input ONCE (it is identical
+                    # every epoch); __getitem__ then just slices it, like wet. This
+                    # removes the per-step ``10**(gr/20)`` over all B streams from
+                    # the (single-threaded) dataloader hot path.
+                    "amp": amplitude_match(dry[..., :n], gr_db).contiguous(),
                     "K": n // self.S,
                 }
             )
 
         self.B = len(self.cache)
         self.K = max(c["K"] for c in self.cache) if self.cache else 0
-        ram = (
-            sum(d.numel() for d in self.dry_by_song.values())
-            + sum(c["gr_db"].numel() + c["wet"].numel() for c in self.cache)
+        # dry is only needed to build ``amp`` above; free it to offset amp's RAM.
+        self.dry_by_song = {}
+        ram = sum(
+            c["gr_db"].numel() + c["wet"].numel() + c["amp"].numel() for c in self.cache
         ) * 4 / 1024**2
         print(
             f"StatefulOutputTransformerDataset: B={self.B} streams "
@@ -159,16 +166,13 @@ class StatefulOutputTransformerDataset(Dataset):
         for r, c in enumerate(self.cache):
             if s < c["K"]:
                 o = s * S
-                dry = self.dry_by_song[c["song"]]
                 wet_b[r] = c["wet"][:, o : o + S]
+                amp = c["amp"]
                 lo = o - (w - 1)
                 if lo < 0:  # first chunk: zero-pad the left context
-                    amp = amplitude_match(dry[:, : o + S], c["gr_db"][:, : o + S])
-                    inp_b[r, :, (w - 1) - o :] = amp
+                    inp_b[r, :, (w - 1) - o :] = amp[:, : o + S]
                 else:
-                    inp_b[r] = amplitude_match(
-                        dry[:, lo : o + S], c["gr_db"][:, lo : o + S]
-                    )
+                    inp_b[r] = amp[:, lo : o + S]
                 mask[r] = 1.0
         return inp_b, wet_b, mask, (s == 0)
 
