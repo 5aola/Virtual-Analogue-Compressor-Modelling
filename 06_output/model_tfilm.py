@@ -1,48 +1,43 @@
-"""GR-conditioned output-transformer LSTM (continuous TFiLM conditioning).
+"""GR-conditioned output-transformer LSTM (diffssl ``tvcond`` conditioning).
 
 Extends ``OutputTransformerLSTM`` (the amplitude-matched grey box) by feeding the
 **exported gain-reduction curve** back in as a *continuous, time-varying*
-conditioning signal — not as the 4 static knobs (threshold/attack/release/ratio)
-used in ``05_conditioning``.
+conditioning signal — using the *same conditioning mechanism as the diffssl
+``LSTM32TVC`` baseline*, not the 4 static knobs of ``05_conditioning``.
 
-Why this is the right conditioning, and where it comes from in the SOTA
---------------------------------------------------------------------------
-nablafx / Optical-DRC provide two FiLM families (``nablafx.processors.components``):
+Conditioning mechanism — identical structure to diffssl ``cond_type="tvcond"``
+--------------------------------------------------------------------------------
+nablafx's LSTM ``tvcond`` path (``nablafx/processors/lstm.py``) does *not* FiLM
+anything despite the name. It:
 
-* ``TFiLM`` — modulates blocks from a **static** ``cond=[B, cond_dim]`` (the
-  knobs). Used by ``05_conditioning``.
-* ``TVFiLMCond`` + ``TVFiLMMod`` (nablafx ``cond_type="tvcond"``,
-  ``processors/lstm.py``) — the **time-varying** path. ``TVFiLMCond`` runs a
-  block-rate LSTM over ``|x|`` to *synthesise* a dynamic conditioning sequence,
-  which ``TVFiLMMod`` then applies block-wise.
+  1. runs ``TVFiLMCond`` — max-pool the signal to block rate, then a block-rate
+     LSTM emits a learned ``cond_dim``-wide time-varying sequence;
+  2. upsamples that sequence back to sample rate and **concatenates it to the
+     LSTM input** (``x = cat([x, cond], dim=1)``).
 
-``TVFiLMCond`` only exists because the SOTA has to *learn* a dynamic signal from
-a static knob — it has no ground-truth envelope. **We already have it: the
-exported GR curve is precisely that dynamic conditioning sequence.** So we drop
-the learned generator and feed the real GR curve straight into ``TVFiLMMod``.
+We reproduce exactly that, with two deliberate choices:
 
-Two complementary, flag-gated injection points (both default on):
+  * **GR-driven generator.** ``TVFiLMCond`` only pools ``|x|`` (+static knobs)
+    because the SOTA has no ground-truth envelope and must *learn* a dynamic
+    signal. We already have it — the exported GR curve *is* that sequence — so the
+    generator's block-rate LSTM reads the (normalised) GR instead of ``|x|``.
+  * **Functional state.** nablafx's ``TVFiLMCond`` keeps its LSTM state internally
+    (``reset_state``/``detach_state``); here the conditioning LSTM state is
+    threaded through the model's ``state`` tuple as a third element, so it carries
+    across TBPTT chunks alongside the two main LSTM states.
 
-  1. ``use_tvfilm`` — pool ``gr_db`` to block rate, embed it (with its
-     block-to-block delta ≈ attack/release rate), and **block-wise FiLM-modulate
-     the LSTM hidden features** before the output head (the headline TFiLM).
-  2. ``concat_gr`` — concat the sample-rate normalised GR to the LSTM input (the
-     nablafx ``tvcond`` injection point) so the recurrence itself is GR-aware.
-
-The residual-add baseline is preserved: ``dense_out`` is still zero-init, so the
-correction is exactly 0 at step 0 regardless of the FiLM scaling — the net starts
-at the validated amplitude-matched signal and only learns GR-gated coloration.
+Amplitude matching is unchanged: the model input is ``dry * 10**(gr_db/20)``, and
+the GR curve additionally drives the conditioning. The residual-add baseline is
+preserved: ``dense_out`` is zero-init, so the correction is exactly 0 at step 0
+regardless of the conditioning — the net starts at the validated amplitude-matched
+signal and only learns GR-gated coloration.
 """
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from nablafx.processors.components import TVFiLMMod
 
 from amplitude_match import GR_DB_MAX, GR_DB_MIN
 
@@ -54,64 +49,36 @@ def _normalize_gr(gr_db: torch.Tensor) -> torch.Tensor:
     return (gr_db.clamp(GR_DB_MIN, GR_DB_MAX) - GR_DB_MIN) / (GR_DB_MAX - GR_DB_MIN)
 
 
-class GRFilmConditioner(nn.Module):
-    """Block-wise time-varying FiLM driven by the exported GR curve.
+class GRTVCond(nn.Module):
+    """diffssl ``tvcond`` conditioning generator, GR-driven.
 
-    Pools the sample-aligned ``gr_db`` to block rate, lifts it (optionally with
-    its block-to-block delta) to a small embedding, and applies nablafx
-    ``TVFiLMMod`` to the feature stream. ``TVFiLMMod`` is stateless (a 1x1 conv
-    adaptor + block-wise affine), so no recurrent conditioning state has to be
-    carried across TBPTT chunks — only the two main LSTM states.
+    Structurally identical to nablafx ``TVFiLMCond`` (max-pool to block rate ->
+    block-rate LSTM -> upsample to sample rate), but the generator reads the
+    exported GR curve instead of ``|x|`` + static knobs, and its LSTM state is
+    threaded functionally so it carries across TBPTT chunks.
+
+    forward: ``gr_db [B, 1, S] -> cond_seq [B, cond_dim, S]`` plus the LSTM state.
     """
 
-    def __init__(
-        self,
-        nfeatures: int,
-        block_size: int = 256,
-        cond_channels: int = 8,
-        use_delta: bool = True,
-    ):
+    def __init__(self, cond_dim: int = 16, block_size: int = 128, num_layers: int = 1):
         super().__init__()
+        self.cond_dim = cond_dim
         self.block_size = block_size
-        self.use_delta = use_delta
-        in_ch = 2 if use_delta else 1
-        self.embed = nn.Sequential(
-            nn.Conv1d(in_ch, cond_channels, kernel_size=1),
-            nn.PReLU(cond_channels),
-        )
-        self.tvfilm = TVFiLMMod(
-            nfeatures=nfeatures, cond_dim=cond_channels, block_size=block_size
-        )
-        self._init_identity(nfeatures)
+        # max-pool over the (non-negative, normalised) GR == diffssl's abs+pool,
+        # capturing the peak compression depth in each block.
+        self.pool = nn.MaxPool1d(kernel_size=block_size)
+        self.lstm = nn.LSTM(1, cond_dim, num_layers, batch_first=True)
 
-    def _init_identity(self, nfeatures: int) -> None:
-        """Start the FiLM as an exact no-op (g=1, b=0).
-
-        ``TVFiLMMod`` modulates ``x_out = x_in * g + b`` where ``(g, b)`` are the
-        two halves of the 1x1-conv adaptor output. Default random init would apply
-        a *random* affine to the LSTM features at step 0 — and keep changing it —
-        which the residual head then has to learn through, badly slowing
-        convergence. Zero the adaptor weight and set its bias so g=1, b=0: the
-        layer begins as identity (matching the unconditioned baseline) and learns
-        GR modulation gradually."""
-        with torch.no_grad():
-            nn.init.zeros_(self.tvfilm.adaptor.weight)
-            nn.init.zeros_(self.tvfilm.adaptor.bias)
-            self.tvfilm.adaptor.bias[:nfeatures] = 1.0  # g = 1 (first half); b = 0
-
-    def forward(self, x: torch.Tensor, gr_db: torch.Tensor) -> torch.Tensor:
-        # x: [B, nfeatures, S]   gr_db: [B, 1, S]  (sample-aligned)
-        s = x.shape[-1]
-        nsteps = math.ceil(s / self.block_size)  # matches TVFiLMMod's padded nsteps
-        grn = _normalize_gr(gr_db)
-        gr_blk = F.adaptive_avg_pool1d(grn, nsteps)  # [B, 1, nsteps] block-rate GR
-        if self.use_delta:
-            delta = gr_blk - F.pad(gr_blk, (1, 0))[..., :-1]  # rate of change (attack/release)
-            cond = torch.cat((gr_blk, delta), dim=1)
-        else:
-            cond = gr_blk
-        cond = self.embed(cond)  # [B, cond_channels, nsteps]
-        return self.tvfilm(x, cond)  # block-wise affine modulation
+    def forward(self, gr_db: torch.Tensor, state=None):
+        s = gr_db.shape[-1]
+        grn = _normalize_gr(gr_db)                      # [B, 1, S]
+        if s % self.block_size:                         # pad to a whole #blocks
+            grn = F.pad(grn, (0, self.block_size - s % self.block_size))
+        pooled = self.pool(grn).transpose(1, 2)         # [B, nsteps, 1]
+        cond, state = self.lstm(pooled, state)          # [B, nsteps, cond_dim]
+        cond = cond.transpose(1, 2)                     # [B, cond_dim, nsteps]
+        cond = cond.repeat_interleave(self.block_size, dim=-1)[..., :s]  # upsample+crop
+        return cond, state
 
 
 class OutputTransformerTFiLMLSTM(nn.Module):
@@ -124,12 +91,11 @@ class OutputTransformerTFiLMLSTM(nn.Module):
         num_lstm_layers: int = 2,
         output_mode: str = "residual_add",
         out_activation: str = "none",
-        # -- GR conditioning --
-        concat_gr: bool = True,
-        use_tvfilm: bool = True,
-        tvfilm_block_size: int = 256,
-        gr_cond_channels: int = 8,
-        gr_use_delta: bool = True,
+        # -- GR conditioning (diffssl tvcond, GR-driven) --
+        use_gr_cond: bool = True,
+        cond_dim: int = 16,
+        cond_block_size: int = 128,
+        cond_num_layers: int = 1,
     ):
         super().__init__()
         if output_mode not in ("residual_add", "residual_gain", "direct"):
@@ -139,24 +105,22 @@ class OutputTransformerTFiLMLSTM(nn.Module):
         self.window = window
         self.output_mode = output_mode
         self.num_lstm_layers = num_lstm_layers
-        self.concat_gr = concat_gr
-        self.use_tvfilm = use_tvfilm
+        self.use_gr_cond = use_gr_cond
 
         # stride=1 windowed conv: each step sees `window` samples (no downsampling)
         self.proj = nn.Conv1d(1, encoder_channels, kernel_size=window, stride=1)
         self.act = nn.PReLU(encoder_channels)
-        lstm1_in = encoder_channels + (1 if concat_gr else 0)
+        if use_gr_cond:
+            self.gr_cond = GRTVCond(
+                cond_dim=cond_dim, block_size=cond_block_size, num_layers=cond_num_layers
+            )
+        # diffssl tvcond injection point: the conditioning sequence is concatenated
+        # to the LSTM input (encoder features), exactly like nablafx LSTM(C+cond_dim).
+        lstm1_in = encoder_channels + (cond_dim if use_gr_cond else 0)
         self.lstm1 = nn.LSTM(lstm1_in, hidden_size, batch_first=True)
         if num_lstm_layers == 2:
             self.dense_mid = nn.Linear(hidden_size, mid_channels)
             self.lstm2 = nn.LSTM(mid_channels, hidden_size, batch_first=True)
-        if use_tvfilm:
-            self.gr_film = GRFilmConditioner(
-                nfeatures=hidden_size,
-                block_size=tvfilm_block_size,
-                cond_channels=gr_cond_channels,
-                use_delta=gr_use_delta,
-            )
         self.dense_out = nn.Linear(hidden_size, 1)
         self.out_activation = _ACTIVATIONS[out_activation]()
         self._init_output_baseline()
@@ -165,9 +129,9 @@ class OutputTransformerTFiLMLSTM(nn.Module):
         """Start residual modes exactly at the amplitude-matched baseline.
 
         Zero-init ``dense_out`` so the correction is 0 at step 0 (``residual_add``
-        -> out = current input; ``residual_gain`` -> gain = 1). This holds even
-        with GR-FiLM active, since the FiLM only scales the hidden features that
-        ``dense_out`` zeroes out. ``direct`` keeps the default init."""
+        -> out = current input; ``residual_gain`` -> gain = 1). This holds
+        regardless of the conditioning, since the GR cond only feeds the LSTM input
+        whose contribution ``dense_out`` zeroes out. ``direct`` keeps default init."""
         with torch.no_grad():
             if self.output_mode == "residual_add":
                 nn.init.zeros_(self.dense_out.weight)
@@ -187,16 +151,14 @@ class OutputTransformerTFiLMLSTM(nn.Module):
         # gr: [B, 1, S]               sample-aligned GR curve (dB) for this chunk
         cur = x[:, :, self.window - 1 :]            # [B, 1, S] aligned current sample
         h = self.act(self.proj(x)).transpose(1, 2)  # [B, S, C]
-        if self.concat_gr:
-            grn = _normalize_gr(gr).transpose(1, 2)  # [B, S, 1]
-            h = torch.cat((h, grn), dim=-1)          # [B, S, C+1]
-        s1, s2 = (None, None) if state is None else state
+        s1, s2, sc = (None, None, None) if state is None else state
+        if self.use_gr_cond:
+            cond, sc = self.gr_cond(gr, sc)              # [B, cond_dim, S]
+            h = torch.cat((h, cond.transpose(1, 2)), dim=-1)  # [B, S, C+cond_dim]
         h, s1 = self.lstm1(h, s1)                    # [B, S, H]
         if self.num_lstm_layers == 2:
             h = self.dense_mid(h)                    # [B, S, mid]
             h, s2 = self.lstm2(h, s2)                # [B, S, H]
-        if self.use_tvfilm:
-            h = self.gr_film(h.transpose(1, 2), gr).transpose(1, 2)  # GR block-FiLM
         y = self.out_activation(self.dense_out(h)).transpose(1, 2)   # [B, 1, S]
 
         if self.output_mode == "residual_add":
@@ -205,4 +167,4 @@ class OutputTransformerTFiLMLSTM(nn.Module):
             out = cur * y
         else:  # direct
             out = y
-        return (out, (s1, s2)) if return_state else out
+        return (out, (s1, s2, sc)) if return_state else out

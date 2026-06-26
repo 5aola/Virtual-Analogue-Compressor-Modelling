@@ -47,7 +47,9 @@ def _detach_state(state):
     if state is None:
         return None
     d = lambda s: None if s is None else (s[0].detach(), s[1].detach())
-    return (d(state[0]), d(state[1]))
+    # Generic over the number of carried LSTM states: 2 for the plain grey box,
+    # 3 once the diffssl tvcond conditioning LSTM is threaded in (model_tfilm).
+    return tuple(d(s) for s in state)
 
 
 class OutputTransformerSystem(LightningModule):
