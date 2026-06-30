@@ -23,6 +23,15 @@ dependencies = [
     "tqdm>=4.67.3",
 ]
 
+[project.optional-dependencies]
+# Differentiable DSP compressor (02d_digital_pair). torchlpc compiles a C++/
+# OpenMP extension that macOS clang cannot build, so this is kept out of the
+# default dependency set — install with `uv sync --extra digital-pair` on Linux
+# (e.g. Colab), or `pip install torchcomp` in the training notebook.
+digital-pair = [
+    "torchcomp>=0.2.0",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

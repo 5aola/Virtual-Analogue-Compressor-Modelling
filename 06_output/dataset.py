@@ -101,7 +101,17 @@ class StatefulOutputTransformerDataset(Dataset):
         segment_len: int = SEGMENT_LEN,
         window: int = WINDOW,
         sample_rate: int = SAMPLE_RATE,
+        input_signal: str = "amp",
     ):
+        # input_signal selects what the model receives as its waveform input:
+        #   "amp" — amplitude-matched dry (dry x GR gain); the grey-box front-end.
+        #   "raw" — the raw dry signal; the model must learn the gain itself,
+        #           with the GR curve supplied separately as conditioning
+        #           (use with the TFiLM dataset/model). Mirrors the diffssl SOTA
+        #           input, but GR-driven instead of |x|-driven conditioning.
+        if input_signal not in ("amp", "raw"):
+            raise ValueError(f"unknown input_signal: {input_signal!r}")
+        self.input_signal = input_signal
         self.S = segment_len
         self.w = window
         self.sr = sample_rate
@@ -118,17 +128,23 @@ class StatefulOutputTransformerDataset(Dataset):
             if n < self.S:
                 continue
             gr_db = gr_db[..., :n].contiguous()
+            # Precompute the model input ONCE (it is identical every epoch);
+            # __getitem__ then just slices it, like wet. For "amp" this is the
+            # amplitude-matched dry (removes the per-step 10**(gr/20) over all B
+            # streams from the single-threaded dataloader hot path); for "raw" it
+            # is the dry signal itself (the GR is then used only as conditioning).
+            if self.input_signal == "amp":
+                inp_full = amplitude_match(dry[..., :n], gr_db)
+            else:  # "raw"
+                inp_full = dry[..., :n].clone()
             self.cache.append(
                 {
                     "song": m["song"],
                     "setting": m["setting"],
                     "gr_db": gr_db,
                     "wet": wet[..., :n].contiguous(),
-                    # Precompute the amplitude-matched input ONCE (it is identical
-                    # every epoch); __getitem__ then just slices it, like wet. This
-                    # removes the per-step ``10**(gr/20)`` over all B streams from
-                    # the (single-threaded) dataloader hot path.
-                    "amp": amplitude_match(dry[..., :n], gr_db).contiguous(),
+                    # holds amplitude-matched OR raw dry per ``input_signal`` above
+                    "amp": inp_full.contiguous(),
                     "K": n // self.S,
                 }
             )
@@ -196,6 +212,7 @@ class OutputTransformerDataModule(pl.LightningDataModule):
         n_val_songs: int = 1,
         n_test_songs: int = 2,
         split_manifest_path: str | None = None,
+        input_signal: str = "amp",
     ):
         super().__init__()
         self.data_root = data_root
@@ -207,6 +224,7 @@ class OutputTransformerDataModule(pl.LightningDataModule):
         self.n_val_songs = n_val_songs
         self.n_test_songs = n_test_songs
         self.split_manifest_path = split_manifest_path
+        self.input_signal = input_signal
         self.split: SplitManifest | None = None
         self._meta: dict[str, list[dict]] = {}
         self.train_dataset = None
@@ -249,15 +267,18 @@ class OutputTransformerDataModule(pl.LightningDataModule):
 
         if stage in (None, "fit") and self.train_dataset is None:
             self.train_dataset = self.dataset_cls(
-                self._meta["train"], self.segment_len, self.window, self.sample_rate
+                self._meta["train"], self.segment_len, self.window, self.sample_rate,
+                input_signal=self.input_signal,
             )
         if stage in (None, "fit", "validate") and self.val_dataset is None:
             self.val_dataset = self.dataset_cls(
-                self._meta["val"], self.segment_len, self.window, self.sample_rate
+                self._meta["val"], self.segment_len, self.window, self.sample_rate,
+                input_signal=self.input_signal,
             )
         if stage in (None, "test") and self.test_dataset is None:
             self.test_dataset = self.dataset_cls(
-                self._meta["test"], self.segment_len, self.window, self.sample_rate
+                self._meta["test"], self.segment_len, self.window, self.sample_rate,
+                input_signal=self.input_signal,
             )
 
     # batch_size=None: dataset already returns whole step-batches.

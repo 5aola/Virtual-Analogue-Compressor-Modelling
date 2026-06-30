@@ -4449,6 +4449,21 @@ wheels = [
 ]
 
 [[package]]
+name = "torchcomp"
+version = "0.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numba" },
+    { name = "numpy" },
+    { name = "torch" },
+    { name = "torchlpc" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9e/3b/779a363a494e8f03c5359bb743201342964b95ce426516f3d982c2fe6faf/torchcomp-0.2.1.tar.gz", hash = "sha256:6371508f29dd0737f55f90638808f8db241654047a51067b431a67f1220b67b6", size = 8997, upload-time = "2024-11-27T10:46:19.483Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c8/ae/8462d673d71d0b0daf7cfa291d0f509a3ce47018b1c74592c14554d9f085/torchcomp-0.2.1-py3-none-any.whl", hash = "sha256:b2242d9161acce257e5e2f38dfe3da26789670e08b4e07d342b66c368e195dc1", size = 7374, upload-time = "2024-11-27T10:46:17.896Z" },
+]
+
+[[package]]
 name = "torchlibrosa"
 version = "0.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4460,6 +4475,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/a4/67/e4c79da3f15777b9b
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3e/af/ccf007edf442c3c0cd3a98be2c82bc99edc957c04436a759b6e1e01077e0/torchlibrosa-0.1.0-py3-none-any.whl", hash = "sha256:89b65fd28b833ceb6bc74a3d0d87e2924ddc5a845d0a246b194952a4e12a38cb", size = 11741, upload-time = "2023-02-21T09:40:52.58Z" },
 ]
+
+[[package]]
+name = "torchlpc"
+version = "0.7.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numba" },
+    { name = "numpy" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c6/7c/c9771f9cb770b3ec60e71d239a8bdd9cf62f89693f7398535df37f343076/torchlpc-0.7.2.tar.gz", hash = "sha256:260a765645cdf0112d3fcfcebc41d11855ac52264b3185f24068ad873b1b0be3", size = 20625, upload-time = "2025-06-21T10:09:31.602Z" }
 
 [[package]]
 name = "torchmetrics"
@@ -4694,6 +4720,11 @@ dependencies = [
     { name = "tqdm" },
 ]
 
+[package.optional-dependencies]
+digital-pair = [
+    { name = "torchcomp" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "auraloss", specifier = ">=0.4.0" },
@@ -4711,8 +4742,10 @@ requires-dist = [
     { name = "tf-keras", specifier = ">=2.18.0" },
     { name = "torch", specifier = ">=2.10.0" },
     { name = "torchaudio", specifier = ">=2.10.0" },
+    { name = "torchcomp", marker = "extra == 'digital-pair'", specifier = ">=0.2.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]
+provides-extras = ["digital-pair"]
 
 [[package]]
 name = "wandb"
