@@ -1,11 +1,12 @@
 """diffssl-style crop dataloader (mirrors ``02b_sota_training/dataset.py``) that
 **also** yields the sample-aligned GR curve, for the GR-TFiLM model.
 
-Kept identical to 02b (ablation contract):
+Kept identical to 02b (ablation contract) except ``batch_size`` (raised for speed):
   - pair inventory: 10 settings × 10 songs (``discover_gr_pairs``)
   - split: ``splits.build_split_manifest`` (seed 42)
-  - non-overlapping ``sample_length`` crops, ``batch_size=16``, train shuffle +
-    ``drop_last``; fresh crop per ``__getitem__`` (state reset every batch).
+  - non-overlapping ``sample_length`` crops, ``batch_size=64`` (diffssl used 16;
+    raised for GPU throughput), train shuffle + ``drop_last``; fresh crop per
+    ``__getitem__`` (state reset every batch).
 
 One addition vs 02b: each item carries the GR crop so the model can use it as a
 time-varying conditioning signal.
@@ -37,7 +38,9 @@ from splits import (
 
 SAMPLE_RATE = 44100
 SAMPLE_LENGTH = 132300  # diffssl LSTM32TVC: 3 s @ 44.1 kHz
-BATCH_SIZE = 16
+BATCH_SIZE = 64  # raised from diffssl's 16: the hidden=32 sample-rate LSTM is
+                 # launch/latency-bound and parallelises over the batch dim, so a
+                 # larger batch cuts batches/epoch ~4x at near-equal step time.
 
 
 def discover_gr_pairs(data_root: str) -> list[dict]:
