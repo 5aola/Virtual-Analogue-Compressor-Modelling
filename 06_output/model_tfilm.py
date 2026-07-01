@@ -1,36 +1,35 @@
-"""GR-conditioned output-transformer LSTM (diffssl ``tvcond`` conditioning).
+"""diffssl LSTM32TVC mirror + GR curve as a TFiLM conditioning signal.
 
-Extends ``OutputTransformerLSTM`` (the amplitude-matched grey box) by feeding the
-**exported gain-reduction curve** back in as a *continuous, time-varying*
-conditioning signal — using the *same conditioning mechanism as the diffssl
-``LSTM32TVC`` baseline*, not the 4 static knobs of ``05_conditioning``.
+This is the ``02b_sota_training`` diffssl ``LSTM32TVC`` recipe
+(``cond_type="tvcond"`` — ``TVFiLMCond`` + sample-rate LSTM), kept **identical**
+for the four static knobs, with **one addition**: the exported gain-reduction
+curve modulates the LSTM hidden features through a true **temporal FiLM**
+(``GRTFiLM``), the γ/β mechanism from the nablafx fork
+(``external/nablafx-for-diffssl-compressor/nablafx/modules.py::TFiLM``) — *not*
+the concat-style ``tvcond``.
 
-Conditioning mechanism — identical structure to diffssl ``cond_type="tvcond"``
---------------------------------------------------------------------------------
-nablafx's LSTM ``tvcond`` path (``nablafx/processors/lstm.py``) does *not* FiLM
-anything despite the name. It:
+```
+raw dry x [B,1,S] ─┐                        4 static knobs p [B,4]
+                   │  tvcond (nablafx TVFiLMCond, UNCHANGED from 02b):
+                   │    pool(|x|)⊕knobs → blockLSTM → cond_seq[16]  (block rate)
+                   │                        │  upsample + crop
+                   └──── cat(x, cond_seq) → [B, 1+16, S]
+                             │
+                        main LSTM(17 → H)  → hidden [B, H, S]
+                             │
+                   GR-TFiLM: pool(GR) → blockLSTM → γ,β[H] per block   ← GR here
+                        modulate  h·γ + β  (block-constant, broadcast)
+                             │
+                        Linear(H → 1) → tanh → wet [B,1,S]
+```
 
-  1. runs ``TVFiLMCond`` — max-pool the signal to block rate, then a block-rate
-     LSTM emits a learned ``cond_dim``-wide time-varying sequence;
-  2. upsamples that sequence back to sample rate and **concatenates it to the
-     LSTM input** (``x = cat([x, cond], dim=1)``).
+Two conditioning mechanisms: the **static knobs** via the SOTA ``tvcond`` (kept
+identical to diffssl), the **GR** via a temporal FiLM γ/β modulation.
 
-We reproduce exactly that, with two deliberate choices:
-
-  * **GR-driven generator.** ``TVFiLMCond`` only pools ``|x|`` (+static knobs)
-    because the SOTA has no ground-truth envelope and must *learn* a dynamic
-    signal. We already have it — the exported GR curve *is* that sequence — so the
-    generator's block-rate LSTM reads the (normalised) GR instead of ``|x|``.
-  * **Functional state.** nablafx's ``TVFiLMCond`` keeps its LSTM state internally
-    (``reset_state``/``detach_state``); here the conditioning LSTM state is
-    threaded through the model's ``state`` tuple as a third element, so it carries
-    across TBPTT chunks alongside the two main LSTM states.
-
-Amplitude matching is unchanged: the model input is ``dry * 10**(gr_db/20)``, and
-the GR curve additionally drives the conditioning. The residual-add baseline is
-preserved: ``dense_out`` is zero-init, so the correction is exactly 0 at step 0
-regardless of the conditioning — the net starts at the validated amplitude-matched
-signal and only learns GR-gated coloration.
+State handling mirrors ``nablafx/processors/lstm.py`` so this model is a drop-in
+for the ``02b`` TBPTT system: ``reset_states()`` / ``detach_states()`` clear /
+detach all three stateful LSTMs (main, ``TVFiLMCond``, ``GRTFiLM``); ``forward``
+carries state internally rather than threading a tuple.
 """
 
 from __future__ import annotations
@@ -39,132 +38,141 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nablafx.processors.components import TVFiLMCond
+
 from amplitude_match import GR_DB_MAX, GR_DB_MIN
 
-_ACTIVATIONS = {"tanh": nn.Tanh, "none": nn.Identity}
+
+def _reduction_positive(gr_db: torch.Tensor) -> torch.Tensor:
+    """Map a GR curve in dB to ~[0, 1] with **more compression → larger value**.
+
+    ``gr_db`` is negative during compression (``20·log10(wet/dry)``), so
+    ``(GR_DB_MAX − gr_db)`` grows with reduction. ``MaxPool`` over this signal
+    then captures the **peak compression** in each block — the direct analog of
+    diffssl's ``MaxPool(|x|)`` (peak amplitude). Pooling the *normalised* GR
+    instead (as the old ``GRTVCond`` did) inverts this: max would select the
+    least-compressed sample and discard the peak reduction.
+    """
+    return (GR_DB_MAX - gr_db.clamp(GR_DB_MIN, GR_DB_MAX)) / (GR_DB_MAX - GR_DB_MIN)
 
 
-def _normalize_gr(gr_db: torch.Tensor) -> torch.Tensor:
-    """Map a GR curve in dB onto ~[0, 1] using the project-wide GR range."""
-    return (gr_db.clamp(GR_DB_MIN, GR_DB_MAX) - GR_DB_MIN) / (GR_DB_MAX - GR_DB_MIN)
+class GRTFiLM(nn.Module):
+    """GR-driven temporal FiLM (γ/β modulation over time).
 
+    Port of the nablafx fork's ``TFiLM`` with one change: the block-rate LSTM
+    ingests the **pooled GR curve** (1 channel) instead of the pooled feature
+    map, so the modulation is a function of the ground-truth gain reduction.
+    Emits ``2·nfeatures`` per block → split into γ, β and applied
+    block-constant to the ``nfeatures``-wide hidden features.
 
-class GRTVCond(nn.Module):
-    """diffssl ``tvcond`` conditioning generator, GR-driven.
-
-    Structurally identical to nablafx ``TVFiLMCond`` (max-pool to block rate ->
-    block-rate LSTM -> upsample to sample rate), but the generator reads the
-    exported GR curve instead of ``|x|`` + static knobs, and its LSTM state is
-    threaded functionally so it carries across TBPTT chunks.
-
-    forward: ``gr_db [B, 1, S] -> cond_seq [B, cond_dim, S]`` plus the LSTM state.
+    forward: ``feat [B, C, S]``, ``gr_db [B, 1, S]`` → modulated ``[B, C, S]``.
+    LSTM state is kept internally (``reset_state`` / ``detach_state``) so it
+    carries across TBPTT sub-steps alongside the other LSTMs.
     """
 
-    def __init__(self, cond_dim: int = 16, block_size: int = 128, num_layers: int = 1):
+    def __init__(self, nfeatures: int, block_size: int = 128, num_layers: int = 1):
         super().__init__()
-        self.cond_dim = cond_dim
+        self.nfeatures = nfeatures
         self.block_size = block_size
-        # max-pool over the (non-negative, normalised) GR == diffssl's abs+pool,
-        # capturing the peak compression depth in each block.
+        self.num_layers = num_layers
         self.pool = nn.MaxPool1d(kernel_size=block_size)
-        self.lstm = nn.LSTM(1, cond_dim, num_layers, batch_first=True)
+        # GR (1 ch) -> 2*nfeatures (gamma, beta)
+        self.lstm = nn.LSTM(1, nfeatures * 2, num_layers, batch_first=True)
+        self.hidden_state = None
 
-    def forward(self, gr_db: torch.Tensor, state=None):
-        s = gr_db.shape[-1]
-        grn = _normalize_gr(gr_db)                      # [B, 1, S]
-        if s % self.block_size:                         # pad to a whole #blocks
-            grn = F.pad(grn, (0, self.block_size - s % self.block_size))
-        pooled = self.pool(grn).transpose(1, 2)         # [B, nsteps, 1]
-        cond, state = self.lstm(pooled, state)          # [B, nsteps, cond_dim]
-        cond = cond.transpose(1, 2)                     # [B, cond_dim, nsteps]
-        cond = cond.repeat_interleave(self.block_size, dim=-1)[..., :s]  # upsample+crop
-        return cond, state
+    def reset_state(self) -> None:
+        self.hidden_state = None
+
+    def detach_state(self) -> None:
+        if self.hidden_state is not None:
+            self.hidden_state = tuple(h.detach() for h in self.hidden_state)
+
+    def forward(self, feat: torch.Tensor, gr_db: torch.Tensor) -> torch.Tensor:
+        b, c, s = feat.shape
+        pad = (self.block_size - s % self.block_size) % self.block_size
+        if pad:
+            feat = F.pad(feat, (0, pad))
+            gr_db = F.pad(gr_db, (0, pad))
+        s_pad = feat.shape[-1]
+        nsteps = s_pad // self.block_size
+
+        gr_down = self.pool(_reduction_positive(gr_db))     # [B, 1, nsteps]
+        mod, self.hidden_state = self.lstm(gr_down.transpose(1, 2), self.hidden_state)
+        mod = mod.transpose(1, 2).reshape(b, 2 * c, nsteps, 1)  # [B, 2C, nsteps, 1]
+        gamma, beta = torch.chunk(mod, 2, dim=1)            # each [B, C, nsteps, 1]
+
+        blocks = feat.reshape(b, c, nsteps, self.block_size)
+        out = (blocks * gamma + beta).reshape(b, c, s_pad)
+        return out[..., :s]
 
 
-class OutputTransformerTFiLMLSTM(nn.Module):
+class GRTFiLMDiffSSLLSTM(nn.Module):
+    """diffssl LSTM(tvcond) for the static knobs + GR-driven temporal FiLM."""
+
     def __init__(
         self,
-        window: int = 64,
-        encoder_channels: int = 8,
-        hidden_size: int = 16,
-        mid_channels: int = 8,
-        num_lstm_layers: int = 2,
-        output_mode: str = "residual_add",
-        out_activation: str = "none",
-        # -- GR conditioning (diffssl tvcond, GR-driven) --
-        use_gr_cond: bool = True,
-        cond_dim: int = 16,
+        num_controls: int = 4,
+        hidden_size: int = 32,
+        num_layers: int = 1,
+        # -- static-knob conditioning (diffssl tvcond, unchanged) --
+        tvcond_dim: int = 16,
         cond_block_size: int = 128,
         cond_num_layers: int = 1,
+        # -- GR conditioning (temporal FiLM) --
+        gr_tfilm_block_size: int = 128,
+        gr_tfilm_num_layers: int = 1,
     ):
         super().__init__()
-        if output_mode not in ("residual_add", "residual_gain", "direct"):
-            raise ValueError(f"unknown output_mode: {output_mode}")
-        if num_lstm_layers not in (1, 2):
-            raise ValueError("num_lstm_layers must be 1 or 2")
-        self.window = window
-        self.output_mode = output_mode
-        self.num_lstm_layers = num_lstm_layers
-        self.use_gr_cond = use_gr_cond
+        self.num_controls = num_controls
+        self.hidden_size = hidden_size
+        self.cond_block_size = cond_block_size
 
-        # stride=1 windowed conv: each step sees `window` samples (no downsampling)
-        self.proj = nn.Conv1d(1, encoder_channels, kernel_size=window, stride=1)
-        self.act = nn.PReLU(encoder_channels)
-        if use_gr_cond:
-            self.gr_cond = GRTVCond(
-                cond_dim=cond_dim, block_size=cond_block_size, num_layers=cond_num_layers
-            )
-        # diffssl tvcond injection point: the conditioning sequence is concatenated
-        # to the LSTM input (encoder features), exactly like nablafx LSTM(C+cond_dim).
-        lstm1_in = encoder_channels + (cond_dim if use_gr_cond else 0)
-        self.lstm1 = nn.LSTM(lstm1_in, hidden_size, batch_first=True)
-        if num_lstm_layers == 2:
-            self.dense_mid = nn.Linear(hidden_size, mid_channels)
-            self.lstm2 = nn.LSTM(mid_channels, hidden_size, batch_first=True)
-        self.dense_out = nn.Linear(hidden_size, 1)
-        self.out_activation = _ACTIVATIONS[out_activation]()
-        self._init_output_baseline()
+        # diffssl tvcond: pool(|x|) + concat knobs -> block LSTM -> cond_seq[16]
+        self.cond_nn = TVFiLMCond(
+            input_dim=1,
+            output_dim=tvcond_dim,
+            cond_dim=num_controls,
+            block_size=cond_block_size,
+            num_layers=cond_num_layers,
+        )
+        # main sample-rate LSTM (raw input + upsampled cond_seq)
+        self.lstm = nn.LSTM(1 + tvcond_dim, hidden_size, num_layers, batch_first=True)
+        self.main_state = None
+        # GR temporal FiLM on the hidden features
+        self.gr_tfilm = GRTFiLM(
+            nfeatures=hidden_size,
+            block_size=gr_tfilm_block_size,
+            num_layers=gr_tfilm_num_layers,
+        )
+        self.lin = nn.Linear(hidden_size, 1)
 
-    def _init_output_baseline(self) -> None:
-        """Start residual modes exactly at the amplitude-matched baseline.
+    # -- state API matching nablafx / the 02b TBPTT system ------------------
+    def reset_states(self) -> None:
+        self.main_state = None
+        self.cond_nn.reset_state()
+        self.gr_tfilm.reset_state()
 
-        Zero-init ``dense_out`` so the correction is 0 at step 0 (``residual_add``
-        -> out = current input; ``residual_gain`` -> gain = 1). This holds
-        regardless of the conditioning, since the GR cond only feeds the LSTM input
-        whose contribution ``dense_out`` zeroes out. ``direct`` keeps default init."""
-        with torch.no_grad():
-            if self.output_mode == "residual_add":
-                nn.init.zeros_(self.dense_out.weight)
-                nn.init.zeros_(self.dense_out.bias)
-            elif self.output_mode == "residual_gain":
-                nn.init.zeros_(self.dense_out.weight)
-                nn.init.ones_(self.dense_out.bias)
+    def detach_states(self) -> None:
+        if self.main_state is not None:
+            self.main_state = tuple(h.detach() for h in self.main_state)
+        self.cond_nn.detach_state()
+        self.gr_tfilm.detach_state()
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        gr: torch.Tensor,
-        state=None,
-        return_state: bool = False,
-    ):
-        # x:  [B, 1, S + window - 1]  amplitude-matched, with left context
-        # gr: [B, 1, S]               sample-aligned GR curve (dB) for this chunk
-        cur = x[:, :, self.window - 1 :]            # [B, 1, S] aligned current sample
-        h = self.act(self.proj(x)).transpose(1, 2)  # [B, S, C]
-        s1, s2, sc = (None, None, None) if state is None else state
-        if self.use_gr_cond:
-            cond, sc = self.gr_cond(gr, sc)              # [B, cond_dim, S]
-            h = torch.cat((h, cond.transpose(1, 2)), dim=-1)  # [B, S, C+cond_dim]
-        h, s1 = self.lstm1(h, s1)                    # [B, S, H]
-        if self.num_lstm_layers == 2:
-            h = self.dense_mid(h)                    # [B, S, mid]
-            h, s2 = self.lstm2(h, s2)                # [B, S, H]
-        y = self.out_activation(self.dense_out(h)).transpose(1, 2)   # [B, 1, S]
+    def forward(self, x: torch.Tensor, gr: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        # x:  [B, 1, S] raw dry     gr: [B, 1, S] GR curve (dB)     p: [B, num_controls]
+        s = x.shape[-1]
 
-        if self.output_mode == "residual_add":
-            out = cur + y
-        elif self.output_mode == "residual_gain":
-            out = cur * y
-        else:  # direct
-            out = y
-        return (out, (s1, s2, sc)) if return_state else out
+        # -- static-knob conditioning (diffssl tvcond) --
+        cond = self.cond_nn(x, p)                                # [B, 16, nsteps]
+        cond = cond.repeat_interleave(self.cond_block_size, dim=-1)[..., :s]
+        h = torch.cat((x, cond), dim=1).transpose(1, 2)         # [B, S, 1+16]
+
+        # -- main LSTM --
+        h, self.main_state = self.lstm(h, self.main_state)      # [B, S, H]
+
+        # -- GR temporal FiLM on the hidden features --
+        h = self.gr_tfilm(h.transpose(1, 2), gr)                # [B, H, S]
+
+        # -- output --
+        y = self.lin(h.transpose(1, 2)).transpose(1, 2)         # [B, 1, S]
+        return torch.tanh(y)
