@@ -1,12 +1,12 @@
 """DSP-prior GR predictor: differentiable compressor gain computer + LSTM correction.
 
-Replaces the bins recipe (`model.StatefulCondLSTMGRBins`) after the measured
-val→test generalization gap (0.267 → 0.554 dB MAE): the raw-waveform conv
-frontend can encode song-specific timbre, and the bins/LDS/CFG machinery
-patched training-dynamics symptoms of that representation problem. Here the
-frontend is constrained to the *detector family* (rectify → smooth → dB) —
-phase- and timbre-blind by construction — and the knobs act through a physical
-gain computer instead of a learned feature modulation:
+Greybox ABLATION of `model_detector_gr.DetectorGRLSTM` (the default blackbox
+predictor — see its docstring for the shared frontend rationale). Kept for the
+where-does-structure-help comparison: same detector-bank frontend, but the
+knobs act through a physical gain computer instead of a learned mapping. Note
+the GR target is a synthetic extraction (RMS-1024 wet/dry ratio), so this
+model asserts more structure than the target guarantees — that is the
+hypothesis this ablation tests.
 
     dry ─ x² ─ frame energy (hop 256) ─ one-pole detector bank (learnable τ) ─ dB
                                         │ ch 0 = prior level L
@@ -49,49 +49,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from gr_target import GR_DB_MAX, GR_DB_MIN, normalize_gr_01
+from model_detector_gr import ENV_DB_FLOOR, OnePoleDetectorBank
 from splits import DIFFSSL_PARAM_RANGES
 from src.dsp import PARAM_ORDER
-
-ENV_DB_FLOOR = -80.0  # envelope dB clamp / input normalisation floor
-
-
-class OnePoleDetectorBank(nn.Module):
-    """N exact one-pole energy smoothers with learnable time constants.
-
-    Implemented as a causal depthwise conv over frame energy: for coefficient
-    a = exp(-Δt/τ) the impulse response (1-a)·a^j is truncated at
-    `kernel_frames` and renormalized to unit DC gain, so the conv equals the
-    IIR one-pole up to the truncation tail. Differentiable in τ, no scan.
-    """
-
-    def __init__(
-        self,
-        taus_ms: tuple[float, ...] = (12.0, 2.0, 40.0, 150.0),
-        hop_size: int = 256,
-        sample_rate: int = 44100,
-        kernel_frames: int = 256,
-    ):
-        super().__init__()
-        self.num_detectors = len(taus_ms)
-        self.kernel_frames = kernel_frames
-        self.dt = hop_size / sample_rate
-        self.log_tau = nn.Parameter(torch.log(torch.tensor(taus_ms) / 1000.0))
-
-    @property
-    def taus_ms(self) -> torch.Tensor:
-        return self.log_tau.detach().exp() * 1000.0
-
-    def kernels(self) -> torch.Tensor:
-        tau = self.log_tau.exp().clamp(5e-4, 0.5)                    # 0.5 ms … 500 ms
-        a = torch.exp(-self.dt / tau)                                # [N]
-        j = torch.arange(self.kernel_frames, device=a.device, dtype=a.dtype)
-        k = (1.0 - a[:, None]) * a[:, None] ** j                     # [N, K] newest→oldest
-        k = k / k.sum(dim=-1, keepdim=True)                          # fix truncation
-        return k.flip(-1).unsqueeze(1)                               # conv kernel, causal
-
-    def forward(self, energy_padded: torch.Tensor) -> torch.Tensor:
-        # energy_padded: [B, 1, K-1+T] (caller prepends K-1 context frames)
-        return F.conv1d(energy_padded, self.kernels())               # [B, N, T]
 
 
 class KnobToDSPParams(nn.Module):
