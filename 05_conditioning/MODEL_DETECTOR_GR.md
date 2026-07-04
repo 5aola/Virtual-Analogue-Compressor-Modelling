@@ -1,8 +1,28 @@
 # Detector-LSTM Gain-Reduction Predictor (`DetectorGRLSTM`)
 
 **Location:** `05_conditioning/model_detector_gr.py`, `system_detector_gr.py`, `dataset_crops.py`, `train_lstm_detector_gr.ipynb`
-**Run:** `lstm_gr_20260702_174039_lstm_detector_gr` — 5.4 k parameters, 49 epochs, test GR MAE **0.268 dB**
+**Run:** `lstm_gr_20260702_174039_lstm_detector_gr` — 5.4 k parameters, 49 epochs, test GR MAE ~~0.268 dB~~ **(invalid — see correction)**
 **Companion document:** [`06_output/MODEL_GAIN_PRIOR.md`](../06_output/MODEL_GAIN_PRIOR.md) (the downstream gain-application model this predictor feeds)
+
+> **⚠ Correction (2026-07-04) — the reported test result is contaminated.**
+> The `20260702_174039` run trained on a Drive dataset that had grown to 15
+> settings: GR curves for the five `test_ground_truth/` pairs had been exported
+> into `gr_curves/`, and the song-level split swept them into **train** (4
+> pairs) and **val** (1 pair — the *only* val pair). The 0.268 dB
+> "test_ground_truth" GR MAE in §6 was therefore measured on trained-on pairs;
+> the honest held-out measurement from that run is the manifest test
+> (Air/NosPalpitants × threshold −12 settings): **0.85 dB**, and the §6.1
+> "generalisation gap closed" comparison against the bins model does not hold.
+> The recipe has since moved to **v2** (`model_type: detector_gr_lstm_film`):
+> the split treats `test_ground_truth/` as the only held-out test set (pairs
+> excluded from train/val by key, leak asserts in `dataset_crops.py` and both
+> notebooks), the detector bank is **8 fixed log-spaced τ (2–800 ms)** — the
+> learnable bank collapsed onto the label's 23 ms RMS window,
+> (2, 12, 40, 150) → (14.6, 15.4, 19.1, 74.8) ms — and conditioning is
+> **polynomial FiLM + GLU after the LSTM** (Comparative-Study recipe;
+> §2.2's "no embedding needed for D=4" misread that reference — plain concat
+> is the Optical-DRC *baseline*). Sections below describe the v1
+> architecture/run until a v2 run replaces them.
 
 ---
 

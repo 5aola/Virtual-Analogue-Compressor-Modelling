@@ -1,15 +1,20 @@
 """Song-level train/val/test splits for multi-setting Diff-SSL training.
 
 NOTE: copied verbatim from ``05_conditioning/splits.py`` (frozen split logic).
-It is duplicated here, rather than imported, so that ``06_conditioning`` is a
+It is duplicated here, rather than imported, so that ``06_output`` is a
 self-contained package on ``sys.path`` with no module-name collision against
 ``05_conditioning`` (both define ``dataset``/``model``/``system``). Keeping the
-code byte-identical guarantees the split (seed 42, n_val=1, n_test=2, test =
-lowest-threshold settings) is exactly the same as the TFiLM GR notebook.
+code byte-identical guarantees the split is exactly the same as the GR
+notebooks — including the v2 external-test policy
+(``discover_test_ground_truth_keys`` + ``build_split_manifest(test_pair_keys=...)``,
+which excludes the ``test_ground_truth/`` pairs from train/val by key) and the
+legacy lowest-threshold policy (seed 42, n_val=1, n_test=2) still used by the
+older 06/02b notebooks.
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import random
@@ -45,6 +50,37 @@ def lowest_threshold_settings(settings: list[str]) -> list[str]:
     """Return all setting folders tied for the minimum threshold value."""
     min_t = min(setting_threshold(s) for s in settings)
     return sorted(s for s in settings if setting_threshold(s) == min_t)
+
+
+def discover_test_ground_truth_keys(data_root: str) -> set[str]:
+    """Pair keys (``song::setting``) of the external held-out test set.
+
+    The ``test_ground_truth/`` folder is the single source of truth for what
+    is held out: any wet export placed there marks its (song, setting) pair
+    as test-only, and ``build_split_manifest(test_pair_keys=...)`` excludes
+    it from train/val — even when a GR curve for it exists under
+    ``gr_curves/`` (those curves then serve as test labels only). This is the
+    guard against the contamination found in run
+    ``lstm_gr_20260702_174039``: exported test GR curves were silently swept
+    into train (4 pairs) and val (1 pair) by the song-level split.
+    """
+    tgt_dir = os.path.join(data_root, "test_ground_truth")
+    if not os.path.isdir(tgt_dir):
+        raise FileNotFoundError(
+            f"No test_ground_truth/ under {data_root} — it defines the held-out "
+            "test set; refusing to build a split without it."
+        )
+    keys: set[str] = set()
+    for setting in sorted(os.listdir(tgt_dir)):
+        sdir = os.path.join(tgt_dir, setting)
+        if not setting.startswith("threshold_") or not os.path.isdir(sdir):
+            continue
+        for wet in glob.glob(os.path.join(sdir, "*-exported.wav")):
+            song = os.path.basename(wet).replace("-exported.wav", "")
+            keys.add(pair_key(song, setting))
+    if not keys:
+        raise FileNotFoundError(f"test_ground_truth/ under {data_root} holds no wet exports")
+    return keys
 
 
 @dataclass
@@ -110,13 +146,49 @@ def build_split_manifest(
     n_train_songs: int | None = None,
     n_val_songs: int = 1,
     n_test_songs: int = 2,
+    test_pair_keys: set[str] | None = None,
 ) -> SplitManifest:
-    """Build train/val/test pair lists.
+    """Build train/val/test pair lists. Two test policies:
 
-  - **Train / val**: all settings × held-out song subsets.
-  - **Test**: lowest-threshold settings × held-out test songs only.
+  - **``test_pair_keys`` given** (current recipe): those exact pairs — the
+    external ``test_ground_truth/`` exports, see
+    ``discover_test_ground_truth_keys`` — are the held-out test set and are
+    excluded from train/val **by key**. Every remaining (song, setting) pair
+    is fair training material (including the former lowest-threshold test
+    songs); the remaining songs are split song-level into train/val.
+    ``n_test_songs`` is ignored.
+  - **``test_pair_keys`` None** (legacy notebooks): test = lowest-threshold
+    settings × ``n_test_songs`` held-out songs; train/val = all settings ×
+    remaining song subsets.
     """
     settings = sorted({p["setting"] for p in pairs})
+
+    if test_pair_keys is not None:
+        test_pairs = [p for p in pairs if pair_key(p["song"], p["setting"]) in test_pair_keys]
+        rest = [p for p in pairs if pair_key(p["song"], p["setting"]) not in test_pair_keys]
+        rest_songs = sorted({p["song"] for p in rest})
+        train_songs, val_songs, _ = make_song_split(
+            rest_songs,
+            n_train=n_train_songs,
+            n_val=n_val_songs,
+            n_test=0,
+            seed=seed,
+        )
+        train_set, val_set = set(train_songs), set(val_songs)
+        train_pairs = [p for p in rest if p["song"] in train_set]
+        val_pairs = [p for p in rest if p["song"] in val_set]
+        return SplitManifest(
+            seed=seed,
+            train_songs=sorted(train_set),
+            val_songs=sorted(val_set),
+            test_songs=sorted({p["song"] for p in test_pairs}),
+            test_settings=sorted({p["setting"] for p in test_pairs}),
+            all_settings=settings,
+            train_pair_keys=sorted(pair_key(p["song"], p["setting"]) for p in train_pairs),
+            val_pair_keys=sorted(pair_key(p["song"], p["setting"]) for p in val_pairs),
+            test_pair_keys=sorted(pair_key(p["song"], p["setting"]) for p in test_pairs),
+        )
+
     songs = sorted({p["song"] for p in pairs})
     test_settings = lowest_threshold_settings(settings)
 

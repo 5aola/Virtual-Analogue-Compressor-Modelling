@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader, Dataset
 from splits import (
     SplitManifest,
     build_split_manifest,
+    discover_test_ground_truth_keys,
     filter_pairs_by_keys,
     normalize_setting_params,
 )
@@ -40,10 +41,17 @@ SAMPLE_LENGTH = 132300  # diffssl LSTM32TVC: 3 s @ 44.1 kHz
 BATCH_SIZE = 16
 
 
-def discover_gr_pairs(data_root: str) -> list[dict]:
+def discover_gr_pairs(data_root: str, include_test_ground_truth: bool = False) -> list[dict]:
     """All (song, setting) pairs with dry, wet, GR curve, and static params on disk.
 
-    Same inventory as ``02b_sota_training.discover_diffssl_wet_pairs``.
+    Same inventory as ``02b_sota_training.discover_diffssl_wet_pairs``. Wet
+    audio resolves under ``processed_ground_truth/<setting>/`` and — only with
+    ``include_test_ground_truth`` — falls back to ``test_ground_truth/<setting>/``,
+    which makes the external held-out test pairs loadable (for ``trainer.test``
+    under the v2 split policy). Keep the flag OFF with the legacy
+    lowest-threshold split: a song-level split over test_ground_truth pairs
+    would sweep the test songs into train — the 05_conditioning contamination
+    (run ``lstm_gr_20260702_174039``).
     """
     dry_lookup = {
         os.path.basename(p).replace("_UnmasteredWAV.wav", ""): p
@@ -57,21 +65,30 @@ def discover_gr_pairs(data_root: str) -> list[dict]:
     for setting in sorted(os.listdir(gr_root)):
         if not setting.startswith("threshold_"):
             continue
-        wet_dir = os.path.join(data_root, "processed_ground_truth", setting)
+        wet_dirs = [os.path.join(data_root, "processed_ground_truth", setting)]
+        if include_test_ground_truth:
+            wet_dirs.append(os.path.join(data_root, "test_ground_truth", setting))
         for pt in sorted(glob.glob(os.path.join(gr_root, setting, "*.pt"))):
             song = os.path.splitext(os.path.basename(pt))[0]
-            wet = os.path.join(wet_dir, f"{song}-exported.wav")
-            if song in dry_lookup and os.path.isfile(wet):
-                pairs.append(
-                    {
-                        "song": song,
-                        "setting": setting,
-                        "dry": dry_lookup[song],
-                        "wet": wet,
-                        "gr": pt,
-                        "params": normalize_setting_params(setting),
-                    }
-                )
+            if song not in dry_lookup:
+                continue
+            wet = next(
+                (w for w in (os.path.join(d, f"{song}-exported.wav") for d in wet_dirs)
+                 if os.path.isfile(w)),
+                None,
+            )
+            if wet is None:
+                continue
+            pairs.append(
+                {
+                    "song": song,
+                    "setting": setting,
+                    "dry": dry_lookup[song],
+                    "wet": wet,
+                    "gr": pt,
+                    "params": normalize_setting_params(setting),
+                }
+            )
     return sorted(pairs, key=lambda p: (p["song"], p["setting"]))
 
 
@@ -162,7 +179,18 @@ class GRCropDataset(Dataset):
 
 
 class GRCropDataModule(pl.LightningDataModule):
-    """Custom split manifest + diffssl crop/batch recipe, emitting the GR curve."""
+    """Custom split manifest + diffssl crop/batch recipe, emitting the GR curve.
+
+    Two split policies:
+    - ``test_gt_root`` set (v2): the external ``test_ground_truth/`` pairs
+      (scanned under that root — pass the Drive dataset root on Colab) are the
+      ONLY held-out test set, excluded from train/val by pair key; every other
+      pair trains/validates. ``n_test_songs`` is ignored, and loaded manifests
+      are re-validated so a stale contaminated manifest cannot be resumed.
+    - ``test_gt_root`` None (legacy notebooks): lowest-threshold settings ×
+      ``n_test_songs`` held-out songs, discovery restricted to
+      ``processed_ground_truth/`` wets — byte-compatible with the 02b recipe.
+    """
 
     def __init__(
         self,
@@ -174,6 +202,7 @@ class GRCropDataModule(pl.LightningDataModule):
         n_train_songs: int | None = None,
         n_val_songs: int = 1,
         n_test_songs: int = 2,
+        test_gt_root: str | None = None,
         split_manifest_path: str | None = None,
         num_workers: int = 0,
     ):
@@ -186,6 +215,7 @@ class GRCropDataModule(pl.LightningDataModule):
         self.n_train_songs = n_train_songs
         self.n_val_songs = n_val_songs
         self.n_test_songs = n_test_songs
+        self.test_gt_root = test_gt_root
         self.split_manifest_path = split_manifest_path
         self.num_workers = num_workers
         self.split: SplitManifest | None = None
@@ -196,7 +226,14 @@ class GRCropDataModule(pl.LightningDataModule):
 
     def setup(self, stage: Optional[str] = None) -> None:
         if self.split is None:
-            all_pairs = discover_gr_pairs(self.data_root)
+            external_test = self.test_gt_root is not None
+            all_pairs = discover_gr_pairs(
+                self.data_root, include_test_ground_truth=external_test
+            )
+            test_keys = (
+                discover_test_ground_truth_keys(self.test_gt_root)
+                if external_test else None
+            )
 
             if self.split_manifest_path and os.path.isfile(self.split_manifest_path):
                 self.split = SplitManifest.load(self.split_manifest_path)
@@ -208,9 +245,19 @@ class GRCropDataModule(pl.LightningDataModule):
                     n_train_songs=self.n_train_songs,
                     n_val_songs=self.n_val_songs,
                     n_test_songs=self.n_test_songs,
+                    test_pair_keys=test_keys,
                 )
                 if self.split_manifest_path:
                     self.split.save(self.split_manifest_path)
+
+            if external_test:
+                leaked = (
+                    set(self.split.train_pair_keys) | set(self.split.val_pair_keys)
+                ) & test_keys
+                assert not leaked, (
+                    f"test_ground_truth pairs leaked into train/val: {sorted(leaked)} — "
+                    "stale/contaminated split manifest? Delete it and rebuild."
+                )
 
             self._meta = {
                 "train": filter_pairs_by_keys(all_pairs, set(self.split.train_pair_keys)),
@@ -220,8 +267,11 @@ class GRCropDataModule(pl.LightningDataModule):
             print(f"Split seed     : {self.split.seed}")
             print(f"Train songs    : {self.split.train_songs}")
             print(f"Val songs      : {self.split.val_songs}")
-            print(f"Test songs     : {self.split.test_songs}")
-            print(f"Test settings  : {self.split.test_settings} (lowest threshold)")
+            if external_test:
+                print(f"Test pairs     : {self.split.test_pair_keys} (external test_ground_truth)")
+            else:
+                print(f"Test songs     : {self.split.test_songs}")
+                print(f"Test settings  : {self.split.test_settings} (lowest threshold)")
             print(
                 f"Pair counts    : train={len(self._meta['train'])} "
                 f"val={len(self._meta['val'])} test={len(self._meta['test'])} "

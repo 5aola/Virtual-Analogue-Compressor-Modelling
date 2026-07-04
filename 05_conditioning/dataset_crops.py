@@ -23,7 +23,12 @@ import torchaudio
 from torch.utils.data import DataLoader, Dataset
 
 from dataset import discover_diffssl_gr_pairs
-from splits import SplitManifest, build_split_manifest, filter_pairs_by_keys
+from splits import (
+    SplitManifest,
+    build_split_manifest,
+    discover_test_ground_truth_keys,
+    filter_pairs_by_keys,
+)
 
 SAMPLE_RATE = 44100
 SAMPLE_LENGTH = 132300  # 3 s @ 44.1 kHz, same as 02b / 06_output
@@ -105,7 +110,16 @@ class GRPredCropDataset(Dataset):
 
 
 class GRPredCropDataModule(pl.LightningDataModule):
-    """Custom split manifest + diffssl crop/batch recipe for GR prediction."""
+    """Custom split manifest + diffssl crop/batch recipe for GR prediction.
+
+    Test policy: the external ``test_ground_truth/`` pairs (scanned under
+    ``test_gt_root``, default ``data_root``) are the ONLY held-out test set
+    and are excluded from train/val by pair key — see
+    ``splits.discover_test_ground_truth_keys``. On Colab pass the Drive
+    dataset root as ``test_gt_root`` (the local cache holds dry + gr_curves
+    only). Loaded manifests are re-validated against the test keys, so a
+    stale contaminated manifest cannot be resumed silently.
+    """
 
     def __init__(
         self,
@@ -116,7 +130,7 @@ class GRPredCropDataModule(pl.LightningDataModule):
         split_seed: int = 42,
         n_train_songs: int | None = None,
         n_val_songs: int = 1,
-        n_test_songs: int = 2,
+        test_gt_root: str | None = None,
         split_manifest_path: str | None = None,
         num_workers: int = 0,
     ):
@@ -128,7 +142,7 @@ class GRPredCropDataModule(pl.LightningDataModule):
         self.split_seed = split_seed
         self.n_train_songs = n_train_songs
         self.n_val_songs = n_val_songs
-        self.n_test_songs = n_test_songs
+        self.test_gt_root = test_gt_root
         self.split_manifest_path = split_manifest_path
         self.num_workers = num_workers
         self.split: SplitManifest | None = None
@@ -141,6 +155,7 @@ class GRPredCropDataModule(pl.LightningDataModule):
         # idempotent: trainer.fit / trainer.test re-invoke this — build once
         if self.split is None:
             all_pairs = discover_diffssl_gr_pairs(self.data_root)
+            test_keys = discover_test_ground_truth_keys(self.test_gt_root or self.data_root)
 
             if self.split_manifest_path and os.path.isfile(self.split_manifest_path):
                 self.split = SplitManifest.load(self.split_manifest_path)
@@ -151,10 +166,18 @@ class GRPredCropDataModule(pl.LightningDataModule):
                     seed=self.split_seed,
                     n_train_songs=self.n_train_songs,
                     n_val_songs=self.n_val_songs,
-                    n_test_songs=self.n_test_songs,
+                    test_pair_keys=test_keys,
                 )
                 if self.split_manifest_path:
                     self.split.save(self.split_manifest_path)
+
+            leaked = (
+                set(self.split.train_pair_keys) | set(self.split.val_pair_keys)
+            ) & test_keys
+            assert not leaked, (
+                f"test_ground_truth pairs leaked into train/val: {sorted(leaked)} — "
+                "stale/contaminated split manifest? Delete it and rebuild."
+            )
 
             self.meta = {
                 "train": filter_pairs_by_keys(all_pairs, set(self.split.train_pair_keys)),
@@ -164,8 +187,7 @@ class GRPredCropDataModule(pl.LightningDataModule):
             print(f"Split seed     : {self.split.seed}")
             print(f"Train songs    : {self.split.train_songs}")
             print(f"Val songs      : {self.split.val_songs}")
-            print(f"Test songs     : {self.split.test_songs}")
-            print(f"Test settings  : {self.split.test_settings} (lowest threshold)")
+            print(f"Test pairs     : {self.split.test_pair_keys} (external test_ground_truth)")
             print(
                 f"Pair counts    : train={len(self.meta['train'])} "
                 f"val={len(self.meta['val'])} test={len(self.meta['test'])} "
