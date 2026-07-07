@@ -191,7 +191,13 @@ class La2aCropDataModule(pl.LightningDataModule):
     the split parameters (fractions, ``crops_per_pair``, ``sample_length``) for
     exact reproduction in eval; when present it is loaded and its parameters
     take precedence over the constructor arguments.
+
+    ``DATASET_CLS`` is the per-crop dataset built for each split — a subclass
+    can override it to change the emitted item (e.g. ``dataset_la2a_gr`` drops
+    ``wet`` for the GR-predictor contract) without reimplementing ``setup``.
     """
+
+    DATASET_CLS = La2aCropDataset
 
     def __init__(
         self,
@@ -272,15 +278,15 @@ class La2aCropDataModule(pl.LightningDataModule):
             rms_window=self.rms_window,
         )
         if stage in (None, "fit") and self.train_dataset is None:
-            self.train_dataset = La2aCropDataset(
+            self.train_dataset = self.DATASET_CLS(
                 self._pairs, "train", crops_per_pair=self.crops_per_pair["train"], **common
             )
         if stage in (None, "fit", "validate") and self.val_dataset is None:
-            self.val_dataset = La2aCropDataset(
+            self.val_dataset = self.DATASET_CLS(
                 self._pairs, "val", crops_per_pair=self.crops_per_pair["val"], **common
             )
         if stage in (None, "test") and self.test_dataset is None:
-            self.test_dataset = La2aCropDataset(
+            self.test_dataset = self.DATASET_CLS(
                 self._pairs, "test", crops_per_pair=self.crops_per_pair["test"], **common
             )
 
