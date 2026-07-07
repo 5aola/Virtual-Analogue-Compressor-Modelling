@@ -49,6 +49,7 @@ for _p in (
     str(REPO_ROOT),                            # `src`
     str(REPO_ROOT / "nablafx"),                # raw ./nablafx clone (TVFiLMCond)
     str(REPO_ROOT / "06_output"),              # gain-prior models + splits
+    str(REPO_ROOT / "09_end2end"),             # GainPriorWSE2ELSTM (predicted-GR cascade)
     str(REPO_ROOT / "03_initial_GR_pred"),     # eval_helpers
 ):
     if _p not in sys.path:
@@ -67,7 +68,10 @@ from amplitude_match import (  # noqa: E402
 )
 from model_gainprior import GainPriorDiffSSLLSTM            # noqa: E402
 from model_gainprior_ws import GainPriorWSDiffSSLLSTM       # noqa: E402
+from model_gainprior_ws_e2e import GainPriorWSE2ELSTM       # noqa: E402  (09_end2end)
+from model_tfilm import GRTFiLMDiffSSLLSTM                  # noqa: E402  (06_output, GR temporal FiLM)
 from model_detector_gr import DetectorGRLSTM                # noqa: E402
+from model_blackbox_gr import BlackboxGRLSTM                # noqa: E402  (05_conditioning, appended path)
 from splits import (  # noqa: E402
     DIFFSSL_PARAM_RANGES, SplitManifest, normalize_setting_params,
 )
@@ -84,6 +88,8 @@ from src.dsp_torch import RMS_WINDOW, gain_reduction_db     # noqa: E402
 THESIS_DATA = Path("/Volumes/Saola's Drive/AllCode/thesis/data")
 DATA_ROOT = str(THESIS_DATA / "Diff-SSL-G-Comp")
 GAIN_PRIOR_RUNS = str(THESIS_DATA / "diffssl_gain_prior_runs")
+E2E_RUNS = str(THESIS_DATA / "diffssl_e2e_runs")
+GR_TFILM_RUNS = str(THESIS_DATA / "diffssl_gr_tfilm_runs")
 GR_PRED_RUNS = str(THESIS_DATA / "gr_pred_runs")
 SR = 44100
 DEVICE = "cpu"
@@ -92,6 +98,10 @@ EVAL_OUT = EXP_DIR / "eval_output"
 # Documented reference runs (override per notebook if needed)
 DEFAULT_GAIN_PRIOR_RUN = "gain_prior_20260702_085618_diffssl_lstm32_gain_prior"
 DEFAULT_DETECTOR_RUN = "lstm_gr_20260702_174039_lstm_detector_gr"
+# 09_end2end predicted-GR cascade: frozen BlackboxGRLSTM (stage 1) -> GainPriorWSE2ELSTM (stage 2)
+DEFAULT_E2E_RUN = "e2e_predgr_20260705_185738_diffssl_lstm32_ws_predgr"
+DEFAULT_BLACKBOX_GR_RUN = "lstm_gr_20260705_125142_lstm_blackbox_gr_film"
+DEFAULT_GR_TFILM_RUN = "gr_tfilm_20260701_195700_diffssl_lstm32_tvc_gr_tfilm"
 
 
 def ensure_eval_out() -> Path:
@@ -156,6 +166,84 @@ def load_gain_prior(run_name: str | None = DEFAULT_GAIN_PRIOR_RUN,
     return model, hp, run_dir
 
 
+def load_gain_prior_e2e(run_name: str | None = DEFAULT_E2E_RUN,
+                        runs_dir: str = E2E_RUNS, device: str = DEVICE):
+    """Load a predicted-GR-cascade gain-prior model (``GainPriorWSE2ELSTM``, 09_end2end).
+
+    Stage 2 of the deployed cascade. Same waveshaper core as
+    ``load_gain_prior``'s ws variant, plus the ``use_matched_input`` flag; it was
+    trained on the *frozen blackbox predictor's* GR rather than the oracle curve.
+    ``hp['gr_frontend']`` records the exact stage-1 run + checkpoint — pass those
+    to ``load_blackbox_gr`` to reconstruct the same cascade the run was trained as.
+    Returns (model, hparams, run_dir); model in eval mode on ``device``.
+    """
+    run_dir = _resolve_run(runs_dir, run_name, ("GainPriorWSE2ELSTM",))
+    with open(os.path.join(run_dir, "hparams.json")) as f:
+        hp = json.load(f)
+    assert hp.get("model_type") == "GainPriorWSE2ELSTM", hp.get("model_type")
+    m = hp["model"]
+    model = GainPriorWSE2ELSTM(
+        use_matched_input=bool(m.get("use_matched_input", True)),
+        num_controls=int(m["num_controls"]),
+        hidden_size=int(m["hidden_size"]),
+        num_layers=int(m["num_layers"]),
+        tvcond_dim=int(m.get("tvcond_dim", 16)),
+        cond_block_size=int(m.get("cond_block_size", 128)),
+        cond_num_layers=int(m.get("cond_num_layers", 1)),
+        delta_max_db=float(m.get("delta_max_db", 12.0)),
+        use_color=bool(m.get("use_color", True)),
+        ws_hidden=int(m.get("ws_hidden", 8)),
+        ws_film=bool(m.get("ws_film", False)),
+    )
+    ckpt = latest_best_checkpoint(run_dir)
+    sd = torch.load(ckpt, map_location=device, weights_only=False)["state_dict"]
+    model.load_state_dict({k[len("model."):]: v for k, v in sd.items()
+                           if k.startswith("model.")})
+    model.to(device).eval()
+    print(f"Loaded {sum(p.numel() for p in model.parameters()):,}-param "
+          f"{hp['model_type']}  ({Path(run_dir).name} / {Path(ckpt).name})  "
+          f"matched_input={bool(m.get('use_matched_input', True))}")
+    return model, hp, run_dir
+
+
+def load_gr_tfilm(run_name: str | None = DEFAULT_GR_TFILM_RUN,
+                  runs_dir: str = GR_TFILM_RUNS, device: str = DEVICE):
+    """Load a GR-temporal-FiLM model (``GRTFiLMDiffSSLLSTM``, 06_output/model_tfilm).
+
+    LSTM(tvcond) for the static knobs + temporal FiLM driven by the GR curve. GR
+    enters as a *conditioning* (γ/β) signal on the LSTM hidden features, NOT a
+    multiplicative prior — so the amplitude-match baseline is **not** this
+    model's zero-init (unlike the gain-prior / e2e models). Its
+    ``forward(dry, gr, params)`` / ``reset_states`` / ``detach_states`` /
+    ``cond_block_size`` match the gain-prior streaming contract, so
+    ``stream_gain_prior`` drives it unchanged. Trained on the **oracle** GR
+    curve. Returns (model, hparams, run_dir); eval mode on ``device``.
+    """
+    run_dir = _resolve_run(runs_dir, run_name, ("GRTFiLMDiffSSLLSTM",))
+    with open(os.path.join(run_dir, "hparams.json")) as f:
+        hp = json.load(f)
+    assert hp.get("model_type") == "GRTFiLMDiffSSLLSTM", hp.get("model_type")
+    m = hp["model"]
+    model = GRTFiLMDiffSSLLSTM(
+        num_controls=int(m["num_controls"]),
+        hidden_size=int(m["hidden_size"]),
+        num_layers=int(m["num_layers"]),
+        tvcond_dim=int(m.get("tvcond_dim", 16)),
+        cond_block_size=int(m.get("cond_block_size", 128)),
+        cond_num_layers=int(m.get("cond_num_layers", 1)),
+        gr_tfilm_block_size=int(m.get("gr_tfilm_block_size", 128)),
+        gr_tfilm_num_layers=int(m.get("gr_tfilm_num_layers", 1)),
+    )
+    ckpt = latest_best_checkpoint(run_dir)
+    sd = torch.load(ckpt, map_location=device, weights_only=False)["state_dict"]
+    model.load_state_dict({k[len("model."):]: v for k, v in sd.items()
+                           if k.startswith("model.")})
+    model.to(device).eval()
+    print(f"Loaded {sum(p.numel() for p in model.parameters()):,}-param "
+          f"GRTFiLMDiffSSLLSTM  ({Path(run_dir).name} / {Path(ckpt).name})")
+    return model, hp, run_dir
+
+
 def load_detector(run_name: str | None = DEFAULT_DETECTOR_RUN,
                   runs_dir: str = GR_PRED_RUNS, device: str = DEVICE):
     """Load the 05_conditioning DetectorGRLSTM. Returns (model, hparams, run_dir)."""
@@ -183,6 +271,47 @@ def load_detector(run_name: str | None = DEFAULT_DETECTOR_RUN,
     return model, hp, run_dir
 
 
+def load_blackbox_gr(run_name: str | None = DEFAULT_BLACKBOX_GR_RUN,
+                     runs_dir: str = GR_PRED_RUNS, ckpt_name: str | None = None,
+                     device: str = DEVICE):
+    """Load a frozen blackbox GR predictor (``BlackboxGRLSTM``, 05_conditioning).
+
+    Stage 1 of the 09_end2end cascade — the local, inference-only counterpart of
+    ``gr_frontend.load_frozen_gr_predictor``. Its streaming interface is
+    identical to ``DetectorGRLSTM`` (``forward(dry, params, state, return_state)``,
+    ``to_db``, ``hop_size``), so ``stream_detector_gr`` drives it unchanged; the
+    only difference is a learned conv frontend in place of the fixed detector
+    bank. Pass ``ckpt_name`` (e.g. the e2e run's ``hp['gr_frontend']['ckpt']``)
+    to pin the exact checkpoint the cascade was trained against. Returns
+    (model, hparams, run_dir); model frozen + eval on ``device``.
+    """
+    run_dir = _resolve_run(runs_dir, run_name,
+                           ("blackbox_gr_lstm_film", "blackbox_gr_lstm"))
+    with open(os.path.join(run_dir, "hparams.json")) as f:
+        hp = json.load(f)
+    assert hp.get("model_type", "").startswith("blackbox_gr_lstm"), hp.get("model_type")
+    m = hp["model"]
+    model = BlackboxGRLSTM(
+        hop_size=int(hp["hop_size"]),
+        sample_rate=int(hp["sample_rate"]),
+        enc_channels=int(m["enc_channels"]),
+        frontend_channels=int(m["frontend_channels"]),
+        temporal_kernel=int(m["temporal_kernel"]),
+        temporal_dilations=tuple(int(d) for d in m["temporal_dilations"]),
+        hidden_size=int(m["hidden_size"]),
+        film_order=int(m["film_order"]),
+    )
+    ckpt = (os.path.join(run_dir, "checkpoints", ckpt_name) if ckpt_name
+            else latest_best_checkpoint(run_dir))
+    sd = torch.load(ckpt, map_location=device, weights_only=False)["state_dict"]
+    model.load_state_dict({k[len("model."):]: v for k, v in sd.items()
+                           if k.startswith("model.")})
+    model.to(device).eval().requires_grad_(False)
+    print(f"Loaded {sum(p.numel() for p in model.parameters()):,}-param "
+          f"{hp['model_type']}  ({Path(run_dir).name} / {Path(ckpt).name})")
+    return model, hp, run_dir
+
+
 def load_split(run_dir: str) -> SplitManifest:
     return SplitManifest.load(os.path.join(run_dir, "split_manifest.json"))
 
@@ -197,9 +326,21 @@ def pairs_from_keys(keys) -> list[tuple[str, str]]:
 
 def pair_paths(setting: str, song: str,
                data_root: str = DATA_ROOT) -> tuple[str, str, str]:
-    """(dry_wav, wet_wav, gr_curve_pt) paths for one (song, setting) pair."""
+    """(dry_wav, wet_wav, gr_curve_pt) paths for one (song, setting) pair.
+
+    Wet is resolved per-file across the candidate setting dirs so that the
+    external held-out pairs (under ``test_ground_truth/``, the v2 split's test
+    set) load alongside the train/val pairs (under ``processed_ground_truth/``);
+    ``wet_dir_for_setting`` alone is test-blind.
+    """
     dry = os.path.join(data_root, "processed_normalized", f"{song}_UnmasteredWAV.wav")
-    wet = os.path.join(wet_dir_for_setting(data_root, setting), f"{song}-exported.wav")
+    fname = f"{song}-exported.wav"
+    wet_candidates = [
+        os.path.join(data_root, "processed_ground_truth", setting, fname),
+        os.path.join(data_root, "test_ground_truth", setting, fname),
+        os.path.join(data_root, setting, fname),
+    ]
+    wet = next((w for w in wet_candidates if os.path.isfile(w)), wet_candidates[0])
     gr = os.path.join(data_root, "gr_curves", setting, f"{song}.pt")
     return dry, wet, gr
 
@@ -301,11 +442,15 @@ def stream_detector_gr(model, dry: torch.Tensor, params: torch.Tensor,
                        chunk_sec: float = 10.0, sr: int = SR,
                        sample_len: int | None = None, state=None,
                        device: str = DEVICE) -> torch.Tensor:
-    """Stream dry [1,T] through DetectorGRLSTM with explicit state carry.
+    """Stream dry [1,T] through a frame-rate GR predictor with explicit state carry.
 
-    Returns the frame-rate GR curve [1, T//hop] in dB, or — if `sample_len`
-    is given — the clamped, sample-rate-interpolated curve [1, sample_len]
-    (`to_db`, the exact format the gain-prior stage consumes).
+    Works unchanged for either stage-1 model — ``DetectorGRLSTM`` (fixed
+    detector bank) or ``BlackboxGRLSTM`` (learned conv frontend) — since both
+    share the ``forward(dry, params, state, return_state)`` / ``to_db`` /
+    ``hop_size`` streaming contract. Returns the frame-rate GR curve
+    [1, T//hop] in dB, or — if `sample_len` is given — the clamped,
+    sample-rate-interpolated curve [1, sample_len] (`to_db`, the exact format
+    the gain-prior stage consumes).
     """
     hop = int(model.hop_size)
     chunk = max(hop, (int(round(chunk_sec * sr)) // hop) * hop)

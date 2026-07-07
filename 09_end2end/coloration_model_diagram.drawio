@@ -1,0 +1,110 @@
+<mxfile host="app.diagrams.net" version="24.0.0">
+  <diagram id="coloration-model" name="Coloration Model">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="1200" math="1" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ===================== INPUTS ===================== -->
+        <mxCell id="in_x" value="Dry input&#10;x  [B,1,S]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="90" y="40" width="150" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="gr" value="Predicted GR&#10;ĝr  [B,1,S]  (dB)&#10;(from frozen stage-1 predictor)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="460" y="40" width="200" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="in_p" value="Knobs  p  [B,4]&#10;(threshold, ratio, attack, release)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="850" y="40" width="220" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== COLORATION MODEL CONTAINER ===================== -->
+        <mxCell id="g2" value="Coloration model  (GainPriorWSE2ELSTM, 8.4k params)" style="rounded=1;dashed=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#666666;verticalAlign=top;fontStyle=2" vertex="1" parent="1">
+          <mxGeometry x="40" y="130" width="1080" height="840" as="geometry" />
+        </mxCell>
+
+        <!-- GR-prior branch (left) -->
+        <mxCell id="p1" value="clamp ĝr → [-30, +5]&#10;gr_c" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00" vertex="1" parent="1">
+          <mxGeometry x="90" y="170" width="220" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="p2" value="Amplitude match&#10;matched = x · 10^(gr_c/20)   [B,1,S]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00" vertex="1" parent="1">
+          <mxGeometry x="90" y="240" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="p3" value="Compression-positive&#10;gr_pos = (5 − gr_c)/35   [B,1,S]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00" vertex="1" parent="1">
+          <mxGeometry x="90" y="315" width="220" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- Conditioning branch (right): TVFiLMCond -->
+        <mxCell id="gc" value="Knob conditioning  (TVFiLMCond → concatenated, not γ/β FiLM)" style="rounded=1;dashed=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9673a6;verticalAlign=top;fontStyle=2;fontColor=#9673a6" vertex="1" parent="1">
+          <mxGeometry x="760" y="150" width="290" height="330" as="geometry" />
+        </mxCell>
+        <mxCell id="c1" value="MaxPool1d(|x|, block=128)&#10;→ x_down  [B,1,nsteps]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00" vertex="1" parent="1">
+          <mxGeometry x="785" y="185" width="240" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="c2" value="concat( x_down, knobs )&#10;[B,5,nsteps]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00" vertex="1" parent="1">
+          <mxGeometry x="785" y="255" width="240" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="c3" value="Block LSTM  5 → 16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366" vertex="1" parent="1">
+          <mxGeometry x="785" y="325" width="240" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="c4" value="upsample ×128&#10;cond  [B,16,S]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00" vertex="1" parent="1">
+          <mxGeometry x="785" y="395" width="240" height="45" as="geometry" />
+        </mxCell>
+
+        <!-- Recurrent core (center) -->
+        <mxCell id="k1" value="concat( x,  matched,  gr_pos,  cond )&#10;[B,19,S]&#10;(matched dropped → [B,18,S] if use_matched_input=False)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00" vertex="1" parent="1">
+          <mxGeometry x="405" y="440" width="300" height="65" as="geometry" />
+        </mxCell>
+        <mxCell id="k2" value="Main sample-rate LSTM  19 → 32&#10;→ h  [B,S,32]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="405" y="535" width="300" height="55" as="geometry" />
+        </mxCell>
+
+        <!-- Heads -->
+        <mxCell id="hdg" value="Gain-correction head  (zero-init)&#10;Δg = 12·tanh( Linear 32→1 )  [dB]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366" vertex="1" parent="1">
+          <mxGeometry x="405" y="625" width="300" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="hgain" value="Corrected gain&#10;gained = x · 10^((gr_c + Δg)/20)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00" vertex="1" parent="1">
+          <mxGeometry x="90" y="625" width="240" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="ws" value="Waveshaper  (memoryless coloration)&#10;W(s) = s + [ r(s) − r(0) ]&#10;r = tanh-MLP 1→8→8→1, out zero-init&#10;shaped = W(gained)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="90" y="705" width="290" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="hcol" value="Additive color head  (zero-init)&#10;color = Linear 32→1&#10;[B,1,S]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366" vertex="1" parent="1">
+          <mxGeometry x="760" y="625" width="290" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="sum" value="⊕&#10;y = shaped + color" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="440" y="735" width="230" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="out" value="Output (wet)&#10;y  [B,1,S]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="455" y="850" width="200" height="55" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== EDGES ===================== -->
+        <mxCell id="e4" value="ĝr" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="gr" target="p1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="p1" target="p2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="p1" target="p3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e7" value="x" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1" edge="1" parent="1" source="in_x" target="p2"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e8" value="x" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1" edge="1" parent="1" source="in_x" target="c1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e9" value="knobs" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1" edge="1" parent="1" source="in_p" target="c2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="c1" target="c2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="c2" target="c3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="c3" target="c4"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e13" value="x" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1" edge="1" parent="1" source="in_x" target="k1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e14" value="matched" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="p2" target="k1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e15" value="gr_pos" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="p3" target="k1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e16" value="cond" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="c4" target="k1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e17" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="k1" target="k2"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e18" value="h" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="k2" target="hdg"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e19" value="h" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="k2" target="hcol"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e20" value="Δg" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="hdg" target="hgain"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e21" value="gr_c" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1" edge="1" parent="1" source="p1" target="hgain"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e22" value="x" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1" edge="1" parent="1" source="in_x" target="hgain"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e23" value="gained" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="hgain" target="ws"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e24" value="shaped" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="ws" target="sum"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e25" value="color" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="hcol" target="sum"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e26" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block" edge="1" parent="1" source="sum" target="out"><mxGeometry relative="1" as="geometry" /></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
