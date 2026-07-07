@@ -25,7 +25,18 @@ RMS_WINDOW = 1024
 
 
 def windowed_rms(signal: torch.Tensor, window_size: int) -> torch.Tensor:
-    """Sample-rate windowed RMS via 1-D convolution.
+    """Sample-rate windowed RMS via a causal trailing prefix-sum average.
+
+    ``rms[i] = sqrt(mean(signal[i-window_size+1 .. i]**2))`` with the window
+    zero-padded before the file start — the same causal, zero-left-padded
+    convention as an ``F.conv1d(sq, ones/window, padding=window-1)`` (which this
+    replaces), but computed in ``O(T)`` from cumulative sums instead of
+    ``O(T * window_size)``. At ``window_size=1024`` that is the difference
+    between a per-crop cost that starves the GPU and one that is negligible;
+    the exported ``gr_curves`` recompute on-the-fly in the LA2A loader relies on
+    this. The prefix sum runs in float64 so the long-window subtraction does not
+    lose precision to catastrophic cancellation, then casts back to the input
+    dtype — output matches the conv path to ~1e-6.
 
     Args:
         signal: ``[T]``, ``[C, T]``, or ``[B, C, T]`` audio.
@@ -46,12 +57,10 @@ def windowed_rms(signal: torch.Tensor, window_size: int) -> torch.Tensor:
 
     batch, channels, frames = sig.shape
     sq = sig.reshape(batch * channels, 1, frames) ** 2
-    kernel = (
-        torch.ones(1, 1, window_size, device=sig.device, dtype=sq.dtype)
-        / window_size
-    )
-    pad = window_size - 1
-    rms_sq = F.conv1d(sq, kernel, padding=pad)[..., :frames]
+    # trailing window sum via prefix sums: sum[i] = csum[i] - csum[i-window].
+    csum = torch.cumsum(sq.double(), dim=-1)
+    csum_shift = F.pad(csum, (window_size, 0))[..., :frames]  # csum[i-window], 0 before start
+    rms_sq = ((csum - csum_shift) / window_size).to(sq.dtype)
     rms = torch.sqrt(rms_sq.clamp(min=1e-10)).reshape(batch, channels, frames)
 
     if orig_ndim == 1:
